@@ -11,11 +11,13 @@ This document lists what is built today and the ideas worth doing next.
 - Scratches are ordinary files, so the folder can be synced, grepped or put under git. Edits save automatically (debounced).
 - The file type comes from the extension and can be changed later. When content is pasted into an empty scratch or used for "New Scratch from Clipboard", its type is detected automatically (JSON, XML, HTML, Markdown, HTTP, diff, CSV/TSV, code and more).
 - Scratches can be organised in folders: a folders column, drag and drop, creating a folder from the "new" menu, and rename, move and delete.
-- The sidebar list can be grouped by type or by date edited. A two-row header holds the controls and a clickable breadcrumb. Use ⌘⇧M to show or hide the sidebar, and ⌘1 to reveal the current scratch in it.
+- The sidebar list can be grouped by type or by date edited. A two-row header holds the controls and a clickable breadcrumb. Use ⌃⌘S to show or hide the sidebar, and ⌘1 to reveal the current scratch in it.
+- **Tabs:** Chrome-style tabs for open files in the toolbar. Drag to reorder, middle-click or × to close, double-click to rename, and right-click for Close Others / Close to the Left / Close to the Right. ⌘W closes a tab, ⌥⌘W closes the others, and ⌃⇥ / ⌃⇧⇥ switch tabs.
 - Navigation:
   - Back and forward history.
   - Recent Scratches (⌘E), which also lists files opened from outside the scratch folder.
   - Next and previous scratch.
+- **Go to Symbol (⌘[)** shows an outline of the current file for every file type. Languages with a Lezer grammar are read from the syntax tree; the others (HTTP requests, SQL statements, tables, plain text) from their lines.
 - **Go to Scratch by Name (⇧⌘O)** works like IntelliJ's "Go to File":
   - Fuzzy matching on camel humps and word starts, e.g. `apcl` finds `api-client.http` and `FIS` finds `FindInScratches`.
   - Matched letters are highlighted.
@@ -39,7 +41,7 @@ This document lists what is built today and the ideas worth doing next.
 - Copy File Path, Copy File, Reveal in Finder, and multi-select actions (compare, copy, delete).
 
 ### Editor
-- CodeMirror 6 with syntax highlighting for JSON, XML, HTML, Markdown, HTTP, diff, CSV/TSV, JavaScript/TypeScript, Java, Python, shell, CSS, SQL, YAML, TOML, properties, Kotlin, Go, Rust and C/C++.
+- CodeMirror 6 with syntax highlighting for JSON, XML, HTML, Markdown, HTTP, diff, CSV/TSV, JavaScript/TypeScript, Java, Python, shell, CSS, SQL, YAML, OpenAPI/Swagger, TOML, properties, Kotlin, Go, Rust and C/C++.
 - IntelliJ-style keymap, which can be customised:
   - multi-caret editing (next occurrence, carets above and below, carets at line ends);
   - extend and shrink selection, duplicate, delete or move lines;
@@ -58,7 +60,9 @@ This document lists what is built today and the ideas worth doing next.
 - Find Action (⇧⌘A) runs any command, dev tool or text transform (encode/decode, hash, case conversion, line tools, time, insert).
 
 ### Preview
-- Markdown and HTML preview: off, split or full.
+- Markdown and HTML preview: off, split or full. Markdown is sanitised and renders Mermaid diagrams; HTML runs in a sandboxed iframe with scripts disabled.
+- **OpenAPI / Swagger** specs (`openapi.yaml`, `swagger.json`…) render as an API reference with Swagger UI, Scalar or the Kong spec renderer, all bundled so they work offline.
+- **Export:** Markdown and HTML previews export as PDF, HTML or MHTML; OpenAPI references export as a self-contained HTML page or MHTML.
 - **Copy Preview as Rich Text:** a Copy button in the Markdown preview (and a menu command) puts HTML, RTF and plain text on the clipboard, so it pastes formatted into Mail, Notes, Docs, Confluence or Slack.
 
 ### CSV and TSV
@@ -90,11 +94,12 @@ This document lists what is built today and the ideas worth doing next.
 ### Running code
 - Run Java (pick a JDK), JavaScript (Node, falling back to JavaScriptCore), TypeScript, Python and shell scratches, with a run console.
 - A shared npm `package.json` and `node_modules` for JS/TS scratches.
-- HTTP client for `.http` files: run one request or all of them, copy as cURL, paste cURL, open a response in a new scratch.
+- HTTP client for `.http` files: run one request or all of them, copy as cURL, paste cURL, open a response in a new scratch. `@name = value` variables, dynamic variables (`{{$uuid}}`, `{{$timestamp}}`, `{{$isoTimestamp}}`, `{{$randomInt}}`) and `< path` file bodies are supported.
 - Diff scratches: compare two scratches, or a scratch with the clipboard, in a side-by-side diff view.
 
 ### Dev tools
-- Dedicated pages: Base64, URL encoding, HTML entities, string escaping, hex, a JWT decoder, hashes, a case converter, line tools, text statistics, timestamps and generators.
+- Dedicated pages: Base64, URL encoding, HTML entities, string escaping, hex, a JWT decoder, hashes (including HMAC), a case converter, line tools, text statistics, timestamps and generators.
+- **MCP Tester:** connects to Model Context Protocol servers over stdio or SSE/HTTP, configured with `mcpServers` JSON or form fields. It shows server info, lists tools, prompts and resources, and calls tools through a form generated from each tool's input schema.
 
 ## Roadmap ideas
 
@@ -122,7 +127,7 @@ This document lists what is built today and the ideas worth doing next.
 
 ### Editing
 - Snippets and live templates, with variables such as date, UUID and clipboard.
-- Multiple editor tabs or split editors, so two scratches can be shown side by side.
+- Split editors, so two scratches can be shown side by side.
 - Markdown helpers: a table formatter, auto-continued lists, paste a URL over a selection to make a link, and a table of contents.
 - JSON tools: JSONPath/jq queries, sort keys, convert to YAML, CSV or TypeScript types, and schema validation.
 - Inline evaluation for JavaScript and Python (results shown next to lines, like Quokka).
@@ -145,7 +150,7 @@ This document lists what is built today and the ideas worth doing next.
 - Regex tester, cron expression explainer, colour converter, UUID/ULID inspector.
 - Number base converter, and a unit and data-size converter.
 - Text diff of the clipboard history, plus clipboard history itself.
-- JWT encoder and signer, and HMAC.
+- JWT encoder and signer.
 - QR code generator.
 
 ### Polish

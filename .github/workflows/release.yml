@@ -1,0 +1,41 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install web dependencies
+        run: npm ci --no-audit --no-fund
+        working-directory: web
+
+      - name: Build app
+        run: scripts/build-app.sh release
+
+      - name: Package
+        run: |
+          cd build
+          ditto -c -k --keepParent ScratchPad.app "ScratchPad-${GITHUB_REF_NAME}-macos-arm64.zip"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "build/ScratchPad-${GITHUB_REF_NAME}-macos-arm64.zip" \
+            --title "ScratchPad $GITHUB_REF_NAME" \
+            --generate-notes

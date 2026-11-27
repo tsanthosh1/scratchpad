@@ -33,6 +33,7 @@ export class FormatError extends Error {
 
 /** Returns the formatted text or throws a FormatError (with a 1-based position when known). */
 export async function formatSource(language, src, { tabSize, compact }) {
+  if (language === 'openapi') language = /^\s*[{[]/.test(src) ? 'json' : 'yaml';
   const unit = ' '.repeat(tabSize);
   try {
     if (language === 'json') return formatJson(src, compact ? null : unit);

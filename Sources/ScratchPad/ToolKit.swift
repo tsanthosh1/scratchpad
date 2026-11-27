@@ -63,7 +63,7 @@ final class ToolActionButton: NSControl {
 
     private let icon = NSImageView()
     private let label = NSTextField(labelWithString: "")
-    private let style: Style
+    private(set) var style: Style
     private let handler: (ToolActionButton) -> Void
     private var hovering = false { didSet { needsDisplay = true } }
     private var pressed = false { didSet { needsDisplay = true } }
@@ -122,6 +122,17 @@ final class ToolActionButton: NSControl {
         symbol = name
         icon.image = name.flatMap { NSImage(systemSymbolName: $0, accessibilityDescription: nil) }
         icon.isHidden = name == nil
+    }
+
+    func setTitle(_ text: String?) {
+        label.stringValue = text ?? ""
+        label.isHidden = text == nil
+        needsDisplay = true
+    }
+
+    func setStyle(_ newStyle: Style) {
+        style = newStyle
+        needsDisplay = true
     }
 
     /// Briefly shows a confirmation such as "Copied", then restores the button.

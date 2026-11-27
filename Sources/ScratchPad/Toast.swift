@@ -1,14 +1,20 @@
 import AppKit
 
-/// Short-lived, non-interactive notice floating near the bottom of a window.
+/// Short-lived notice floating near the bottom of a window, optionally with buttons (then it stays up longer).
 /// Lives in a child window so it sits above the web view without joining the split view layout.
 @MainActor
 final class Toast {
+    struct Action {
+        let title: String
+        let run: () -> Void
+    }
+
     private static var current: NSPanel?
     private static var hideWork: DispatchWorkItem?
+    private static var targets: [ActionTarget] = []
 
     static func show(_ message: String, symbol: String = "checkmark.circle.fill", tint: NSColor = .systemGreen,
-                     in parent: NSWindow?, duration: TimeInterval = 2.4) {
+                     in parent: NSWindow?, duration: TimeInterval? = nil, actions: [Action] = []) {
         guard let parent else { return }
         dismiss(animated: false)
 
@@ -22,8 +28,18 @@ final class Toast {
         label.textColor = .labelColor
         label.lineBreakMode = .byTruncatingMiddle
 
-        let stack = NSStackView(views: [icon, label])
+        let buttons = actions.map { action -> NSButton in
+            let target = ActionTarget { dismiss(animated: true); action.run() }
+            targets.append(target)
+            let button = NSButton(title: action.title, target: target, action: #selector(ActionTarget.fire))
+            button.bezelStyle = .push
+            button.controlSize = .small
+            button.font = .systemFont(ofSize: 12)
+            return button
+        }
+        let stack = NSStackView(views: [icon, label] + buttons)
         stack.spacing = 8
+        if !buttons.isEmpty { stack.setCustomSpacing(14, after: label) }
         stack.edgeInsets = NSEdgeInsets(top: 9, left: 14, bottom: 9, right: 16)
         stack.translatesAutoresizingMaskIntoConstraints = false
 
@@ -53,7 +69,7 @@ final class Toast {
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
-        panel.ignoresMouseEvents = true
+        panel.ignoresMouseEvents = actions.isEmpty
         panel.contentView = background
         panel.alphaValue = 0
         parent.addChildWindow(panel, ordered: .above)
@@ -63,7 +79,7 @@ final class Toast {
 
         let work = DispatchWorkItem { dismiss(animated: true) }
         hideWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + duration, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + (duration ?? (actions.isEmpty ? 2.4 : 8)), execute: work)
     }
 
     private static func dismiss(animated: Bool) {
@@ -71,6 +87,7 @@ final class Toast {
         hideWork = nil
         guard let panel = current else { return }
         current = nil
+        targets.removeAll()
         let close = {
             panel.parent?.removeChildWindow(panel)
             panel.orderOut(nil)
@@ -79,4 +96,10 @@ final class Toast {
         NSAnimationContext.runAnimationGroup({ $0.duration = 0.3; panel.animator().alphaValue = 0 },
                                              completionHandler: { MainActor.assumeIsolated { close() } })
     }
+}
+
+private final class ActionTarget: NSObject {
+    private let handler: () -> Void
+    init(_ handler: @escaping () -> Void) { self.handler = handler }
+    @MainActor @objc func fire() { handler() }
 }

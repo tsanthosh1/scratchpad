@@ -3,6 +3,7 @@ import AppKit
 private extension NSToolbarItem.Identifier {
     static let sidebarToggle = Self("sidebarToggle")
     static let title = Self("title")
+    static let tabs = Self("tabs")
     static let codeGroup = Self("codeGroup")
     static let fileGroup = Self("fileGroup")
     static let toolsGroup = Self("toolsGroup")
@@ -23,9 +24,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private var consoleItem: NSSplitViewItem!
     private let languageButton = ToolbarMenuButton(compact: true)
     private let jdkButton = ToolbarMenuButton(compact: true)
-    /// Scratch ids visited before / after the current one, like a browser's back and forward.
-    private var backStack: [String] = []
-    private var forwardStack: [String] = []
+    private let viewerButton = ToolbarMenuButton(compact: true)
+    private lazy var exportButton = ToolbarStyle.makeCompact(ToolbarStyle.button(
+        symbol: "square.and.arrow.up", tip: "Export…", target: self, action: #selector(exportButtonClicked(_:))))
+    /// Files in the order they were opened (ids, oldest first), and the position of the open one; Back and
+    /// Forward move the position, opening anything new drops the entries after it.
+    private var history: [String] = []
+    private var historyIndex = -1
     private var toolbarButtons: [String: HoverButton] = [:]
     private var previewButtons: [HoverButton] = []
     private lazy var previewGroup = ToolbarGroup(previewButtons.map(ToolbarStyle.makeCompact), compact: true)
@@ -34,9 +39,25 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private let titleField = TitleField()
 
     private(set) var current: Scratch?
+    private let tabBar = TabBarView()
+    static let tabBarHeight: CGFloat = 38
+    /// Files open as tabs, in tab order.
+    private var tabs: [Scratch] = [] {
+        didSet { if tabs != oldValue { Settings.shared.openTabs = tabs.map(\.id) } }
+    }
+    private lazy var emptyPage = EmptyEditorPage { [weak self] id in self?.perform(id) }
     private var messageTimer: Timer?
     private var isDiffing = false
     private let toolPage = DevToolViewController()
+    /// The native page for rich text scratches, shown in place of the code editor.
+    private let richPage = RichTextViewController()
+    /// Documents from outside the scratch folder opened this session, by id, so late saves still find them.
+    private var externalById: [String: Scratch] = [:]
+    /// Scratches created (or switched) to Plain Text on purpose, which keep their type when you paste into them.
+    private var explicitPlainText: Set<String> = []
+    private lazy var gotoPicker = CommandPaletteController(
+        title: "Go to Scratch", placeholder: "Scratch name — fuzzy: “apcl” finds api-client.http · folder/name · name:line",
+        empty: "No matching scratches", noun: ("match", "matches"), verb: "Open", usesRecents: false)
     /// The dev tool page showing in place of the editor, if any.
     private var activeTool: DevTool?
     private var previewBeforeFull: PreviewMode = .split
@@ -50,6 +71,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private lazy var newScratchPicker = CommandPaletteController(
         title: "New Scratch", placeholder: "File type — type to filter", empty: "No matching file types",
         noun: ("file type", "file types"), verb: "Create", usesRecents: false)
+    private lazy var symbolPicker = CommandPaletteController(
+        title: "Go to Symbol", placeholder: "", empty: "No matching symbols", noun: ("symbol", "symbols"),
+        verb: "Go", usesRecents: false, height: 640)
     private lazy var recentPicker = CommandPaletteController(
         title: "Recent Scratches", placeholder: "Recent scratches — type to filter", empty: "No matching scratches",
         noun: ("scratch", "scratches"), verb: "Open", usesRecents: false)
@@ -60,6 +84,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                               backing: .buffered, defer: false)
         window.title = "ScratchPad"
         window.titleVisibility = .hidden
+        // The editor pane paints the tab strip's backdrop under the toolbar itself (see `TabBackdropView`).
+        window.titlebarAppearsTransparent = true
         window.minSize = NSSize(width: 620, height: 320)
         window.toolbarStyle = .unified
         window.tabbingMode = .disallowed
@@ -69,6 +95,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         editor.delegate = self
         runner.delegate = self
         console.onClose = { [weak self] in self?.showConsole(false) }
+        console.onTogglePosition = { [weak self] in self?.toggleConsolePosition() }
         editorPane.onPositionClick = { [weak self] in self?.editor.exec("gotoLine") }
         editorPane.onLanguageClick = { [weak self] button in self?.showLanguageMenu(from: button) }
         editorPane.onPathClick = { [weak self] index, view in self?.showPathMenu(index, from: view) }
@@ -80,6 +107,22 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
         sidebar.delegate = self
         editorPane.webView = editor.webView
+        editorPane.tabStrip = tabBar
+        tabBar.onRename = { [weak self] id in
+            guard let self else { return }
+            if id == self.current?.id { return self.beginRename() }
+            self.activateTab(id)
+            DispatchQueue.main.async { if self.current?.id == id { self.beginRename() } }
+        }
+        tabBar.onSelect = { [weak self] id in self?.activateTab(id) }
+        tabBar.onClose = { [weak self] id in self?.closeTabs { $0.id == id } }
+        tabBar.onReorder = { [weak self] ids in
+            guard let self else { return }
+            let byId = Dictionary(self.tabs.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+            self.tabs = ids.compactMap { byId[$0] }
+        }
+        tabBar.onMenu = { [weak self] id in self?.tabMenu(for: id) }
+        tabBar.onNew = { [weak self] in self?.perform("newScratch") }
         titleField.onRename = { [weak self] name in self?.renameCurrent(to: name) }
 
         sidebarItem = NSSplitViewItem(sidebarWithViewController: sidebar)
@@ -87,20 +130,24 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         sidebarItem.maximumThickness = Settings.shared.foldersPane ? 720 : 420
         sidebarItem.canCollapse = true
 
-        innerSplit.splitView.isVertical = false
+        let isConsoleRight = Settings.shared.consolePosition == .right
+        innerSplit.splitView.isVertical = isConsoleRight
         innerSplit.splitView.dividerStyle = .thin
         let editorItem = NSSplitViewItem(viewController: editorPane)
         editorItem.holdingPriority = .defaultLow
         consoleItem = NSSplitViewItem(viewController: console)
         consoleItem.canCollapse = true
-        consoleItem.minimumThickness = 80
+        consoleItem.minimumThickness = isConsoleRight ? 180 : 120
         consoleItem.holdingPriority = .init(260)
         innerSplit.addSplitViewItem(editorItem)
         innerSplit.addSplitViewItem(consoleItem)
         consoleItem.isCollapsed = true
 
         outerSplit.addSplitViewItem(sidebarItem)
-        outerSplit.addSplitViewItem(NSSplitViewItem(viewController: innerSplit))
+        let contentItem = NSSplitViewItem(viewController: innerSplit)
+        // No line under the toolbar here, so the active tab runs straight into the page below it.
+        contentItem.titlebarSeparatorStyle = .none
+        outerSplit.addSplitViewItem(contentItem)
         outerSplit.splitView.autosaveName = "ScratchPad.outerSplit"
         window.contentViewController = outerSplit
 
@@ -112,6 +159,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         NotificationCenter.default.addObserver(self, selector: #selector(settingsChanged), name: .settingsChanged, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(keymapChanged), name: .keymapChanged, object: nil)
 
+        richPage.onChange = { [weak self] text in
+            guard let self, let scratch = self.richPage.scratch else { return }
+            self.store.saveRich(scratch, text: text)
+        }
         loadInitialScratch()
         toolPage.onOpenInScratch = { [weak self] text in
             guard let self, let scratch = self.createScratch(.text, content: text) else { return }
@@ -131,8 +182,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         if all.isEmpty, let created = try? store.create(language: .text) {
             all = [created]
         }
-        let last = all.first { $0.id == Settings.shared.lastScratch } ?? all.first
-        sidebar.reload(all, select: last)
+        tabs = Settings.shared.openTabs.compactMap(scratch(forId:))
+        let last = tabs.first { $0.id == Settings.shared.lastScratch }
+            ?? all.first { $0.id == Settings.shared.lastScratch } ?? tabs.first ?? all.first
+        sidebar.reload(all, select: last?.isListed == true ? last : nil)
         if let last { open(last) }
     }
 
@@ -144,33 +197,198 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private func scratchFolderChanged() {
         let all = store.list()
         sidebar.refresh(all)
-        guard let current, current.isInScratchFolder, !all.contains(current) else { return }
-        // The open scratch was deleted or renamed elsewhere; move on to another one.
-        editor.forget(id: current.id)
-        self.current = nil
-        var remaining = all
-        if remaining.isEmpty, let created = try? store.create(language: .text) { remaining = [created] }
-        if let next = remaining.first {
-            sidebar.reload(remaining, select: next)
-            open(next)
+        // Files deleted or renamed elsewhere lose their tabs; the open one hands over to a neighbouring tab.
+        let listed = Set(all)
+        dropTabs { $0.isListed ? !listed.contains($0) : !FileManager.default.fileExists(atPath: $0.url.path) }
+    }
+
+    // MARK: Tabs
+
+    /// The file an id names (a path relative to the scratches folder, or an absolute path), if it exists.
+    private func scratch(forId id: String) -> Scratch? {
+        // Files from elsewhere aren't checked until opened (open() reports missing ones): see Scratch(url:readAttributes:).
+        if id.hasPrefix("/") { return Scratch(url: URL(fileURLWithPath: id), readAttributes: false) }
+        let url = AppPaths.scratches.appendingPathComponent(id)
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), !isDirectory.boolValue else { return nil }
+        return Scratch(url: url)
+    }
+
+    private func refreshTabs() {
+        let names = Dictionary(grouping: tabs, by: \.name)
+        tabBar.setTabs(tabs.map { tab in
+            // Same-named files from different folders get their folder name added.
+            let folder = tab.url.deletingLastPathComponent().lastPathComponent
+            let title = (names[tab.name]?.count ?? 0) > 1 ? "\(tab.name) — \(folder)" : tab.name
+            let tip = tab.isInScratchFolder ? "Scratches/\(tab.id)" : ExternalFolders.displayPath(tab.url.path)
+            return TabBarView.Tab(id: tab.id, title: title, symbol: tab.language.symbolName, tint: tab.language.tint, tip: tip)
+        }, active: activeTool == nil ? current?.id : nil)
+    }
+
+    private func activateTab(_ id: String) {
+        guard let tab = tabs.first(where: { $0.id == id }) else { return }
+        if tab == current, activeTool == nil { return focusEditor() }
+        editor.flush { [self] in
+            sidebar.reload(store.list(), select: tab.isListed ? tab : nil)
+            open(tab)
+            focusEditor()
         }
     }
 
-    private func open(_ scratch: Scratch, recordHistory: Bool = true) {
+    private func stepTab(_ delta: Int) {
+        guard !tabs.isEmpty else { return }
+        let index = current.flatMap { tabs.firstIndex(of: $0) } ?? -delta
+        activateTab(tabs[(index + delta + tabs.count) % tabs.count].id)
+    }
+
+    /// Closes the matching tabs, saving first; closing the open file moves to the tab after it (else before it).
+    private func closeTabs(where shouldClose: @escaping (Scratch) -> Bool) {
+        guard tabs.contains(where: shouldClose) else { return }
+        editor.flush { [self] in
+            store.flushWrites()
+            dropTabs(where: shouldClose)
+        }
+    }
+
+    /// Removes tabs without saving (their files are already saved or gone) and picks what to show instead.
+    private func dropTabs(where shouldDrop: (Scratch) -> Bool) {
+        let closing = tabs.filter(shouldDrop)
+        guard !closing.isEmpty || current.map(shouldDrop) == true else { return }
+        var next: Scratch?
+        if let current, shouldDrop(current) {
+            let index = tabs.firstIndex(of: current) ?? tabs.count
+            next = tabs[min(index, tabs.count)...].first { !shouldDrop($0) } ?? tabs[..<min(index, tabs.count)].last { !shouldDrop($0) }
+        }
+        let closingCurrent = current.map(shouldDrop) == true
+        tabs.removeAll(where: shouldDrop)
+        for tab in closing where tab != current { editor.forget(id: tab.id) }
+        guard closingCurrent, let current else { return refreshTabs() }
+        if let next {
+            sidebar.reload(store.list(), select: next.isListed ? next : nil)
+            open(next)
+            if activeTool == nil { focusEditor() }
+        } else {
+            showEmptyState()
+        }
+        editor.forget(id: current.id)
+    }
+
+    /// No tabs left: a placeholder with New / Go to instead of the editor.
+    private func showEmptyState() {
+        current = nil
+        isDiffing = false
+        sidebar.reload(store.list(), select: nil)
+        if activeTool == nil {
+            editorPane.showPage(emptyPage)
+            window?.makeFirstResponder(emptyPage)
+        }
+        updateChrome()
+    }
+
+    private func tabMenu(for id: String?) -> NSMenu? {
+        guard let id else {
+            let menu = NSMenu()
+            menu.addItem(ClosureMenuItem(title: "New Scratch") { [weak self] in self?.perform("newScratch") })
+            let closeAll = ClosureMenuItem(title: "Close All Tabs") { [weak self] in self?.closeTabs { _ in true } }
+            closeAll.isEnabled = !tabs.isEmpty
+            menu.autoenablesItems = false
+            menu.addItem(closeAll)
+            return menu
+        }
+        guard let index = tabs.firstIndex(where: { $0.id == id }) else { return nil }
+        let tab = tabs[index]
+        let menu = NSMenu()
+        func add(_ title: String, _ symbol: String?, enabled: Bool = true, _ run: @escaping () -> Void) {
+            let item = ClosureMenuItem(title: title, handler: run)
+            if let symbol { item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) }
+            item.isEnabled = enabled
+            menu.addItem(item)
+        }
+        menu.autoenablesItems = false
+        let ids = tabs.map(\.id)
+        add("Close", "xmark") { [weak self] in self?.closeTabs { $0.id == id } }
+        add("Close Others", nil, enabled: tabs.count > 1) { [weak self] in self?.closeTabs { $0.id != id } }
+        add("Close Tabs to the Left", "arrow.left.to.line", enabled: index > 0) { [weak self] in
+            self?.closeTabs { (ids.firstIndex(of: $0.id) ?? .max) < index }
+        }
+        add("Close Tabs to the Right", "arrow.right.to.line", enabled: index < tabs.count - 1) { [weak self] in
+            self?.closeTabs { (ids.firstIndex(of: $0.id) ?? -1) > index }
+        }
+        add("Close All", nil) { [weak self] in self?.closeTabs { _ in true } }
+        menu.addItem(.separator())
+        add("Copy Path", "doc.on.doc") { [weak self] in self?.copyPath([tab]) }
+        add("Reveal in Finder", "folder") { NSWorkspace.shared.activateFileViewerSelecting([tab.url]) }
+        if tab.isListed {
+            add("Reveal in Sidebar", "sidebar.left") { [weak self] in
+                guard let self else { return }
+                if self.sidebarItem.isCollapsed { self.sidebarItem.animator().isCollapsed = false }
+                self.sidebar.reveal(tab)
+            }
+        }
+        return menu
+    }
+
+    /// ⌘S: everything is saved as you type, but this writes pending edits right away and says so.
+    private func saveNow() {
+        guard let scratch = current, activeTool == nil else { return NSSound.beep() }
+        let finish = { [self] in
+            store.flushWrites()
+            showMessage("Saved \(scratch.name)")
+        }
+        if showsRichText { finish() } else { editor.flush { DispatchQueue.main.async(execute: finish) } }
+    }
+
+    private func open(_ scratch: Scratch, initialText: String? = nil, recordHistory: Bool = true) {
+        if !scratch.isInScratchFolder, !scratch.isSharedManifest, let reason = Self.unopenableReason(scratch.url) {
+            if reason == "not found" {
+                Settings.shared.openedFiles.removeAll { $0 == scratch.url.path }
+                tabs.removeAll { $0 == scratch }
+                refreshTabs()
+            }
+            Toast.show("Can't open \(scratch.name): \(reason)", symbol: "exclamationmark.triangle.fill",
+                       tint: .systemOrange, in: window)
+            if let current { sidebar.reload(store.list(), select: current.isListed ? current : nil) }
+            return
+        }
         if activeTool != nil { closeTool() }
-        if recordHistory, let previous = current, previous != scratch, previous.isInScratchFolder {
-            backStack.append(previous.id)
-            if backStack.count > 100 { backStack.removeFirst() }
-            forwardStack.removeAll()
+        if recordHistory { recordVisit(scratch) }
+        if !tabs.contains(scratch) {
+            let index = current.flatMap { tabs.firstIndex(of: $0) }.map { $0 + 1 } ?? tabs.count
+            tabs.insert(scratch, at: index)
         }
         current = scratch
         isDiffing = false
-        if scratch.isInScratchFolder {
+        if scratch.isListed {
             Settings.shared.lastScratch = scratch.id
             Settings.shared.recentScratches = [scratch.id] + Settings.shared.recentScratches.filter { $0 != scratch.id }
         }
-        editor.load(id: scratch.id, text: store.read(scratch), language: scratch.language)
+        if !scratch.isInScratchFolder { externalById[scratch.id] = scratch }
+        if scratch.language.isRichText {
+            editor.flush {}
+            let rich = initialText.map { RichTextIO.plain($0) } ?? store.readRich(scratch)
+            richPage.load(scratch, text: rich)
+            editorPane.showPage(richPage.view)
+        } else {
+            editorPane.showPage(nil)
+            let text = initialText ?? store.read(scratch)
+            editor.load(id: scratch.id, text: text, language: scratch.language)
+        }
         updateChrome()
+    }
+
+    /// True while a rich text scratch (not a dev tool) fills the editor area.
+    private var showsRichText: Bool { activeTool == nil && current?.language.isRichText == true }
+
+    private var layoutBeforeEditorOnly: (sidebar: Bool, console: Bool)?
+
+    private func focusEditor() {
+        window?.makeKeyAndOrderFront(nil)
+        if showsRichText {
+            richPage.focus()
+        } else {
+            if let window { window.makeFirstResponder(editor.webView) }
+            editor.focus()
+        }
     }
 
     // MARK: Dev tools
@@ -189,7 +407,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private func closeTool() {
         activeTool = nil
         Settings.shared.lastTool = nil
-        editorPane.showPage(nil)
+        editorPane.showPage(current == nil ? emptyPage : showsRichText ? richPage.view : nil)
         sidebar.setActiveTool(nil)
     }
 
@@ -214,33 +432,65 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func updateChrome() {
-        titleField.isRenamable = activeTool == nil
+        refreshTabs()
+        titleField.isRenamable = activeTool == nil && current != nil
         if let tool = activeTool {
             window?.title = tool.title
             titleField.show(tool.title)
             titleField.toolTip = tool.summary
             editorPane.setPath(["Dev Tools"], name: tool.title)
-            for control in [languageButton, previewGroup, jdkButton, packagesGroup] as [NSView] { control.isHidden = true }
+            for control in [languageButton, previewGroup, viewerButton, exportButton, jdkButton, packagesGroup] as [NSView] { control.isHidden = true }
+            updateToolbarState()
+            return
+        }
+        guard let current else {
+            window?.title = "ScratchPad"
+            titleField.show("ScratchPad")
+            titleField.toolTip = nil
+            editorPane.setPath([], name: "")
+            for control in [languageButton, previewGroup, viewerButton, exportButton, jdkButton, packagesGroup] as [NSView] { control.isHidden = true }
             updateToolbarState()
             return
         }
         languageButton.isHidden = false
-        guard let current else { return }
         window?.title = current.name
         titleField.show(current.name)
-        titleField.toolTip = current.isInScratchFolder ? "\(current.url.path)\nDouble-click to rename" : current.url.path
+        titleField.toolTip = current.isListed ? "\(current.url.path)\nDouble-click to rename" : current.url.path
         languageButton.show(current.language)
         editorPane.setLanguage(current.language)
         updatePreviewControl()
         jdkButton.isHidden = current.language != .java
         packagesGroup.isHidden = ![.javascript, .typescript].contains(current.language) && !current.isSharedManifest
         let location = current.isSharedManifest ? ["Shared Packages"]
-            : current.isInScratchFolder ? ["Scratches"] + current.folder.split(separator: "/").map(String.init)
-            : [(current.url.deletingLastPathComponent().path as NSString).abbreviatingWithTildeInPath]
+            : current.isListed ? breadcrumb(for: current).map(\.title)
+            : [ExternalFolders.displayPath(current.url.deletingLastPathComponent().path)]
         editorPane.setPath(location, name: current.name)
         sidebar.setSharedPackagesActive(current.isSharedManifest)
         if current.language == .java { updateJDKButton() }
         updateToolbarState()
+    }
+
+    /// The folders above a listed file, each with the folder id its breadcrumb opens.
+    private func breadcrumb(for scratch: Scratch) -> [(title: String, id: String)] {
+        var crumbs: [(title: String, id: String)]
+        var id: String
+        var rest: Substring
+        if scratch.isInScratchFolder {
+            crumbs = [("Scratches", "")]
+            id = ""
+            rest = Substring(scratch.folder)
+        } else if let root = scratch.externalRoot {
+            crumbs = [((root as NSString).lastPathComponent, root)]
+            id = root
+            rest = scratch.folder.dropFirst(root.count)
+        } else {
+            return []
+        }
+        for part in rest.split(separator: "/") {
+            id = id.isEmpty ? String(part) : id + "/" + part
+            crumbs.append((String(part), id))
+        }
+        return crumbs
     }
 
     private static var javaTemplate: String {
@@ -250,7 +500,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     /// Folder for new scratches: what's selected in the list, else the open scratch's folder.
     private var newScratchFolder: String {
-        sidebar.targetFolder ?? (current?.isInScratchFolder == true ? current!.folder : "")
+        sidebar.targetFolder ?? (current?.isListed == true ? current!.folder : "")
     }
 
     @discardableResult
@@ -260,8 +510,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 : language == .diff ? DiffFile.template : language == .java ? Self.javaTemplate : content
             let scratch = try store.create(language: language, content: initial, in: folder ?? newScratchFolder)
             if language != .text { Settings.shared.lastLanguage = language }
-            refreshList(select: scratch)
-            open(scratch)
+            open(scratch, initialText: initial)
+            focusEditor()
+            DispatchQueue.main.async { [weak self] in
+                self?.refreshList(select: scratch)
+                self?.focusEditor()
+            }
             return scratch
         } catch {
             presentError(error)
@@ -271,7 +525,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     private func replaceCurrent(with updated: Scratch, from old: Scratch) {
         editor.rename(from: old.id, to: updated.id)
+        if richPage.scratch == old { richPage.retarget(updated) }
+        if explicitPlainText.remove(old.id) != nil, updated.language == .text { explicitPlainText.insert(updated.id) }
         current = updated
+        tabs = tabs.map { $0 == old ? updated : $0 }
         Settings.shared.lastScratch = updated.id
         Settings.shared.recentScratches = Settings.shared.recentScratches.map { $0 == old.id ? updated.id : $0 }
         remapHistory { $0 == old.id ? updated.id : nil }
@@ -285,7 +542,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             do {
                 let updated = try store.changeLanguage(scratch, to: language)
                 replaceCurrent(with: updated, from: scratch)
-                editor.setLanguage(language)
+                if scratch.language.isRichText || language.isRichText {
+                    // The content was converted on disk; reload it in the other kind of editor.
+                    editor.forget(id: scratch.id)
+                    open(updated, recordHistory: false)
+                    focusEditor()
+                } else {
+                    editor.setLanguage(language)
+                }
             } catch {
                 presentError(error)
             }
@@ -296,7 +560,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     /// Inline rename in the toolbar title when it's visible, otherwise a small sheet.
     private func beginRename() {
-        guard let current, current.isInScratchFolder else { return }
+        guard let current, current.isListed else { return }
         if titleField.window != nil, !titleField.isHidden, window?.toolbar?.isVisible == true {
             titleField.beginRename()
         } else {
@@ -333,37 +597,54 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
     }
 
-    /// ⌘⇧← / ⌘⇧→: walks the visit history, skipping scratches that no longer exist.
+    private func recordVisit(_ scratch: Scratch) {
+        if history.indices.contains(historyIndex), history[historyIndex] == scratch.id { return }
+        history = Array(history.prefix(historyIndex + 1)) + [scratch.id]
+        if history.count > 200 { history.removeFirst(history.count - 200) }
+        historyIndex = history.count - 1
+    }
+
+    /// The scratch a history entry names, if it still exists.
+    private func historyTarget(_ id: String) -> Scratch? { scratch(forId: id) }
+
+    /// ⌥⌘← / ⌥⌘→: walks the visit history as far as it goes, skipping files that no longer exist. The position
+    /// moves right away, so repeated presses keep going even while the previous file is still loading.
     private func navigate(back: Bool) {
         // Back from a tool page returns to the scratch underneath it.
         if back, activeTool != nil, let current {
             open(current, recordHistory: false)
-            return editor.focus()
+            return focusEditor()
         }
-        let byId = Dictionary(store.list().map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
-        while let id = back ? backStack.popLast() : forwardStack.popLast() {
-            guard let target = byId[id], target != current else { continue }
-            if let current, current.isInScratchFolder {
-                if back { forwardStack.append(current.id) } else { backStack.append(current.id) }
+        var index = historyIndex
+        while true {
+            index += back ? -1 : 1
+            guard history.indices.contains(index) else { return NSSound.beep() }
+            if history[index] != current?.id, let target = historyTarget(history[index]) {
+                historyIndex = index
+                editor.flush { [self] in
+                    // A later press may already have moved on; only the latest target is opened.
+                    guard historyIndex == index else { return }
+                    sidebar.reload(store.list(), select: target.isListed ? target : nil)
+                    open(target, recordHistory: false)
+                    focusEditor()
+                }
+                return
             }
-            editor.flush { [self] in
-                sidebar.reload(store.list(), select: target)
-                open(target, recordHistory: false)
-                editor.focus()
-            }
-            return
         }
-        NSSound.beep()
+    }
+
+    private var canNavigate: (back: Bool, forward: Bool) {
+        (historyIndex > 0 || (activeTool != nil && current != nil), historyIndex < history.count - 1)
     }
 
     private func remapHistory(_ transform: (String) -> String?) {
-        backStack = backStack.map { transform($0) ?? $0 }
-        forwardStack = forwardStack.map { transform($0) ?? $0 }
+        history = history.map { transform($0) ?? $0 }
     }
 
     /// Keeps the editor cache, the open scratch and the recent list pointing at a scratch that moved on disk.
     private func relocated(_ old: Scratch, to new: Scratch) {
         guard old != new else { return }
+        if richPage.scratch == old { richPage.retarget(new) }
         if old == current {
             editor.rename(from: old.id, to: new.id)
             current = new
@@ -374,6 +655,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
         Settings.shared.recentScratches = Settings.shared.recentScratches.map { $0 == old.id ? new.id : $0 }
         remapHistory { $0 == old.id ? new.id : nil }
+        tabs = tabs.map { $0 == old ? new : $0 }
+        refreshTabs()
     }
 
     /// Same as `relocated` for everything inside a folder that was renamed or moved.
@@ -381,10 +664,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         guard old != new else { return }
         func remap(_ id: String) -> String? { id.hasPrefix(old + "/") ? new + id.dropFirst(old.count) : nil }
         if let current, let id = remap(current.id) {
-            relocated(current, to: Scratch(url: AppPaths.scratches.appendingPathComponent(id)))
+            relocated(current, to: Scratch(url: folderURL(forId: id).standardizedFileURL))
         }
         Settings.shared.recentScratches = Settings.shared.recentScratches.map { remap($0) ?? $0 }
         remapHistory(remap)
+        tabs = tabs.map { tab in remap(tab.id).flatMap(scratch(forId:)) ?? tab }
+        refreshTabs()
         if let last = Settings.shared.lastScratch.flatMap(remap) { Settings.shared.lastScratch = last }
     }
 
@@ -460,7 +745,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         let alert = NSAlert()
         alert.messageText = "Move folder “\(folder.name)” to the Trash?"
         alert.informativeText = count == 0 ? "The folder is empty."
-            : "It contains \(count == 1 ? "1 scratch" : "\(count) scratches"). You can restore it from the Trash."
+            : "It contains \(count == 1 ? "1 file" : "\(count) files"). You can restore it from the Trash."
+        if folder.isExternal {
+            alert.informativeText += "\n\nThis is the real folder at \(ExternalFolders.displayPath(folder.id)), not a copy."
+        }
         alert.addButton(withTitle: "Move to Trash")
         alert.addButton(withTitle: "Cancel")
         alert.beginSheetModal(for: window) { [self] response in
@@ -471,16 +759,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 presentError(error)
                 return
             }
-            if let current, folder.contains(current.id) {
-                editor.forget(id: current.id)
-                self.current = nil
-                var remaining = store.list()
-                if remaining.isEmpty, let created = try? store.create(language: .text) { remaining = [created] }
-                sidebar.reload(remaining, select: remaining.first)
-                if let next = remaining.first { open(next) }
-            } else {
-                refreshList(select: current)
-            }
+            refreshList(select: current)
+            dropTabs { folder.contains($0.id) }
         }
     }
 
@@ -498,7 +778,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         alert.beginSheetModal(for: window) { [self] response in
             if response == .alertFirstButtonReturn { renameCurrent(to: field.stringValue) }
         }
-        let stem = (scratch.name as NSString).deletingPathExtension
+        let stem = Language.stem(of: scratch.name)
         field.currentEditor()?.selectedRange = NSRange(location: 0, length: (stem as NSString).length)
     }
 
@@ -513,9 +793,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         alert.addButton(withTitle: "Cancel")
         alert.beginSheetModal(for: window) { [self] response in
             guard response == .alertFirstButtonReturn else { return }
-            let order = sidebar.orderedScratches
-            let nextCandidate = order.first { !scratches.contains($0) && order.firstIndex(of: $0)! > (order.firstIndex(of: scratches[0]) ?? 0) }
-                ?? order.last { !scratches.contains($0) }
             for scratch in scratches {
                 do {
                     try store.delete(scratch)
@@ -524,16 +801,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                     presentError(error)
                 }
             }
-            var remaining = store.list()
-            if remaining.isEmpty, let created = try? store.create(language: .text) { remaining = [created] }
-            if let current, scratches.contains(current) {
-                self.current = nil
-                let next = nextCandidate.flatMap { remaining.contains($0) ? $0 : nil } ?? remaining.first
-                sidebar.reload(remaining, select: next)
-                if let next { open(next) }
-            } else {
-                sidebar.reload(remaining, select: current)
-            }
+            sidebar.reload(store.list(), select: current.flatMap { scratches.contains($0) ? nil : $0 })
+            dropTabs { scratches.contains($0) }
         }
     }
 
@@ -621,6 +890,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                                  keywords: "text txt plain auto detect") { [weak self] in
             self?.createScratch(.text, in: folder)
         }]
+        items.append(PaletteItem(id: "new.plaintext", title: "Plain Text", category: ".txt  — stays plain text",
+                                 keywords: "text txt plain log", icon: (Language.text.symbolName, Language.text.tint)) { [weak self] in
+            guard let self, let scratch = self.createScratch(.text, in: folder) else { return }
+            self.explicitPlainText.insert(scratch.id)
+        })
         for lang in Language.allCases where lang != .text {
             let extensions = lang.fileExtensions.map { ".\($0)" }.joined(separator: "  ")
             items.append(PaletteItem(id: "new.\(lang.rawValue)", title: lang.displayName, category: extensions,
@@ -646,7 +920,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         let menu: NSMenu
         if current.isSharedManifest {
             menu = index == 0 ? sharedPackagesMenu() : fileMenu(for: current)
-        } else if !current.isInScratchFolder {
+        } else if !current.isListed {
             if index == 0 {
                 menu = NSMenu()
                 menu.addItem(finderItem(current.url.deletingLastPathComponent()))
@@ -654,8 +928,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 menu = fileMenu(for: current)
             }
         } else {
-            let parts = current.folder.split(separator: "/").map(String.init)
-            menu = index > parts.count ? fileMenu(for: current) : folderMenu(parts.prefix(index).joined(separator: "/"))
+            let crumbs = breadcrumb(for: current)
+            menu = index >= crumbs.count ? fileMenu(for: current) : folderMenu(crumbs[index].id)
         }
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: view.bounds.height + 4), in: view)
     }
@@ -673,12 +947,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         let newItem = ClosureMenuItem(title: "New Scratch Here…") { [weak self] in self?.showNewScratchMenu(in: id) }
         newItem.image = NSImage(systemSymbolName: "plus", accessibilityDescription: nil)
         menu.addItem(newItem)
-        let url = id.isEmpty ? AppPaths.scratches : AppPaths.scratches.appendingPathComponent(id)
-        menu.addItem(finderItem(url))
+        menu.addItem(finderItem(folderURL(forId: id)))
+        let findItem = ClosureMenuItem(title: "Find in This Folder…") { [weak self] in self?.findInFolder(id) }
+        findItem.image = NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: nil)
+        menu.addItem(findItem)
 
-        let subfolders = ScratchStore.folders().filter { $0.parent == id }
+        let subfolders = ScratchStore.folders().filter { $0.parent == id && (id.isEmpty ? !$0.isExternal : true) }
             .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-        let scratches = sidebar.scratches.filter { $0.isInScratchFolder && $0.folder == id }
+        let scratches = sidebar.scratches.filter { $0.isListed && $0.folder == id }
             .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
         if !subfolders.isEmpty || !scratches.isEmpty { menu.addItem(.separator()) }
         for folder in subfolders {
@@ -701,12 +977,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private func fileMenu(for scratch: Scratch) -> NSMenu {
         let menu = NSMenu()
         var ids = ["revealInSidebar", "revealScratch", "copyPath", "copyFile"]
-        if scratch.isInScratchFolder { ids.insert("renameScratch", at: 0) }
+        if scratch.isListed { ids.insert("renameScratch", at: 0) }
         for id in ids where isEnabled(id) {
             guard let title = Actions.byId[id]?.title else { continue }
             let item = ClosureMenuItem(title: title) { [weak self] in self?.perform(id) }
             if let key = KeymapStore.shared.key(for: id) { item.toolTip = key.display }
             menu.addItem(item)
+        }
+        if !scratch.isInScratchFolder, !scratch.isSharedManifest {
+            menu.addItem(ClosureMenuItem(title: "Copy into Scratches") { [weak self] in self?.importFiles([scratch.url]) })
         }
         menu.addItem(.separator())
         let language = ClosureMenuItem(title: "Change File Type…") { [weak self] in
@@ -777,7 +1056,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             editor.flush { [self] in
                 sidebar.reload(store.list(), select: nil)
                 open(Scratch(url: url))
-                editor.focus()
+                focusEditor()
                 showMessage("Shared packages for every JS/TS scratch. Add dependencies, then Run to npm install.")
             }
         } catch {
@@ -1005,8 +1284,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func togglePreview(_ mode: PreviewMode) {
-        guard current?.language.canPreview == true else {
-            showMessage("Preview is available for Markdown and HTML scratches", isError: true)
+        guard current != nil, editor.previewAvailable else {
+            showMessage("Preview is available for Markdown, HTML, CSV, TSV and OpenAPI (Swagger) specs", isError: true)
             return
         }
         let currentMode = Settings.shared.previewMode
@@ -1023,8 +1302,16 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     /// The preview switcher only appears for file types that have a preview.
     private func updatePreviewControl() {
-        let visible = current?.language.canPreview ?? false
+        let visible = current != nil && editor.previewAvailable
         previewGroup.isHidden = !visible
+        let kind = activeTool == nil ? exportKind : nil
+        exportButton.isHidden = kind == nil
+        exportButton.toolTip = kind == "openapi" ? "Export API reference (HTML, MHTML)…" : "Export preview (PDF, HTML, MHTML)…"
+        viewerButton.isHidden = kind != "openapi"
+        let viewer = Settings.shared.specViewer
+        viewerButton.show(symbol: viewer.symbol, tint: .secondaryLabelColor, title: viewer.title,
+                          accessibility: "OpenAPI viewer: \(viewer.title)")
+        viewerButton.toolTip = "Show the spec in Swagger UI, Scalar or Kong"
         for (button, mode) in zip(previewButtons, Self.previewModes) {
             button.state = visible && Settings.shared.previewMode == mode ? .on : .off
         }
@@ -1046,10 +1333,54 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             consoleItem.animator().isCollapsed = !show
         }
         toolbarButtons["toggleConsole"]?.state = show ? .on : .off
-        if show, innerSplit.splitView.subviews.count == 2, console.view.frame.height < 120 {
-            let total = innerSplit.splitView.bounds.height
-            innerSplit.splitView.setPosition(max(total * 0.3, min(180, total * 0.5)), ofDividerAt: 0)
+        if show, innerSplit.splitView.subviews.count == 2 {
+            let isRight = Settings.shared.consolePosition == .right
+            let currentSize = isRight ? console.view.frame.width : console.view.frame.height
+            let minComfortable: CGFloat = isRight ? 240 : 180
+            if currentSize < minComfortable {
+                let total = isRight ? innerSplit.splitView.bounds.width : innerSplit.splitView.bounds.height
+                let desired: CGFloat = isRight ? 320 : 220
+                innerSplit.splitView.setPosition(max(200, total - desired), ofDividerAt: 0)
+            }
         }
+    }
+
+    private func toggleConsolePosition() {
+        let newPos: ConsolePosition = Settings.shared.consolePosition == .bottom ? .right : .bottom
+        Settings.shared.consolePosition = newPos
+        applyConsolePosition()
+    }
+
+    private func applyConsolePosition() {
+        let isRight = Settings.shared.consolePosition == .right
+        innerSplit.splitView.isVertical = isRight
+        consoleItem.minimumThickness = isRight ? 180 : 120
+        console.setPosition(Settings.shared.consolePosition)
+        if !consoleItem.isCollapsed {
+            let total = isRight ? innerSplit.splitView.bounds.width : innerSplit.splitView.bounds.height
+            let size: CGFloat = isRight ? 320 : 220
+            innerSplit.splitView.setPosition(max(200, total - size), ofDividerAt: 0)
+        }
+    }
+
+    private var sidebarHasFocus: Bool {
+        guard !sidebarItem.isCollapsed, let responder = window?.firstResponder as? NSView else { return false }
+        return responder.isDescendant(of: sidebar.view)
+    }
+
+    /// Hides the scratch list and console; pressing again brings back what was showing.
+    private func toggleEditorOnly() {
+        if !sidebarItem.isCollapsed || !consoleItem.isCollapsed {
+            layoutBeforeEditorOnly = (!sidebarItem.isCollapsed, !consoleItem.isCollapsed)
+            sidebarItem.animator().isCollapsed = true
+            showConsole(false)
+        } else {
+            let (sidebarShown, consoleShown) = layoutBeforeEditorOnly ?? (true, false)
+            layoutBeforeEditorOnly = nil
+            if sidebarShown { sidebarItem.animator().isCollapsed = false }
+            if consoleShown { showConsole(true) }
+        }
+        focusEditor()
     }
 
     /// Shows the scratch list if hidden and selects, scrolls to and briefly highlights the open scratch.
@@ -1061,6 +1392,149 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         guard let current else { return }
         if sidebarItem.isCollapsed { sidebarItem.animator().isCollapsed = false }
         sidebar.reveal(current)
+    }
+
+    // MARK: Export & OpenAPI viewers
+
+    /// "markdown" or "openapi" when the open file's preview can be exported.
+    private var exportKind: String? {
+        guard current != nil, activeTool == nil, !isDiffing, let kind = editor.previewKind,
+              ["markdown", "openapi"].contains(kind) else { return nil }
+        return kind
+    }
+
+    private var exportPopover: NSPopover?
+
+    private func setSpecViewer(_ viewer: SpecViewer) {
+        Settings.shared.specViewer = viewer
+        editor.setSpecViewer(viewer)
+        updatePreviewControl()
+    }
+
+    private func showViewerMenu(from button: NSView) {
+        let menu = NSMenu()
+        for viewer in SpecViewer.allCases {
+            let item = ClosureMenuItem(title: viewer.title) { [weak self] in self?.setSpecViewer(viewer) }
+            item.image = NSImage(systemSymbolName: viewer.symbol, accessibilityDescription: nil)
+            item.state = viewer == Settings.shared.specViewer ? .on : .off
+            menu.addItem(item)
+        }
+        menu.popUp(positioning: menu.items.first { $0.state == .on }, at: NSPoint(x: 0, y: button.bounds.height + 2), in: button)
+    }
+
+    @objc private func exportButtonClicked(_ sender: NSView) {
+        showExportPopover()
+    }
+
+    private func showExportPopover() {
+        guard let kind = exportKind else { return }
+        let controller: ExportPopoverController
+        let run: (ExportFormat, SpecViewer?) -> Void = { [weak self] format, viewer in
+            self?.exportPopover?.performClose(nil)
+            self?.exportPopover = nil
+            // After the popover has gone: the save sheet can't start while it is closing.
+            DispatchQueue.main.async { self?.exportPreview(format, viewer: viewer) }
+        }
+        if kind == "openapi" {
+            controller = ExportPopoverController(heading: "Export API Reference", options: [
+                .init(format: .html, title: "HTML", detail: "Interactive page with the viewer and the spec built in. Works offline.",
+                      symbol: "safari"),
+                .init(format: .mhtml, title: "MHTML", detail: "Static snapshot with everything expanded, in one file (Chrome, Edge).",
+                      symbol: "doc.richtext"),
+            ], viewers: SpecViewer.allCases, viewer: Settings.shared.specViewer, onExport: run)
+        } else {
+            controller = ExportPopoverController(heading: "Export Preview", options: [
+                .init(format: .pdf, title: "PDF", detail: "Paginated document for printing and sharing.", symbol: "doc.text"),
+                .init(format: .html, title: "HTML", detail: "Standalone web page, styles and diagrams built in.", symbol: "safari"),
+                .init(format: .mhtml, title: "MHTML", detail: "Web archive in one file, images included (Chrome, Edge, Word).",
+                      symbol: "doc.richtext"),
+            ], viewers: [], viewer: Settings.shared.specViewer, onExport: run)
+        }
+        exportPopover?.close()
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.contentViewController = controller
+        exportPopover = popover
+        if !exportButton.isHidden, exportButton.window != nil {
+            popover.show(relativeTo: exportButton.bounds, of: exportButton, preferredEdge: .maxY)
+        } else if let content = window?.contentView {
+            popover.show(relativeTo: NSRect(x: content.bounds.maxX - 60, y: content.bounds.maxY - 90, width: 1, height: 1),
+                         of: content, preferredEdge: .minY)
+        }
+    }
+
+    /// Saves the preview (Markdown) or an API reference page (OpenAPI) in Downloads unless another place is chosen.
+    private func exportPreview(_ format: ExportFormat, viewer chosen: SpecViewer? = nil) {
+        guard let scratch = current, let kind = exportKind, let window else { return }
+        if format == .pdf && kind != "markdown" { return }
+        let viewer = chosen ?? Settings.shared.specViewer
+        let title = Language.stem(of: scratch.name)
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [format.contentType]
+        panel.allowsOtherFileTypes = false
+        panel.nameFieldStringValue = title + (kind == "openapi" ? " (\(viewer.title))" : "") + "." + format.fileExtension
+        panel.directoryURL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+        panel.canCreateDirectories = true
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard response == .OK, let url = panel.url, let self else { return }
+            if format == .mhtml { Toast.show("Exporting \(url.lastPathComponent)…", symbol: "hourglass", tint: .secondaryLabelColor, in: self.window) }
+            if kind == "markdown" {
+                self.exportMarkdown(format, title: title, to: url)
+            } else {
+                self.exportSpec(format, viewer: viewer, title: title, to: url)
+            }
+        }
+    }
+
+    private func exportMarkdown(_ format: ExportFormat, title: String, to url: URL) {
+        editor.previewDocument(title: title, forPrint: format == .pdf) { [weak self] html in
+            guard let self else { return }
+            guard let html else { return self.exportFinished(url, ok: false) }
+            switch format {
+            case .pdf:
+                PDFExport.write(html: html, to: url, window: self.window) { [weak self] ok in self?.exportFinished(url, ok: ok) }
+            case .html:
+                self.write(Data(html.utf8), to: url)
+            case .mhtml:
+                MHTML.make(html: html, title: title) { [weak self] data in self?.write(data, to: url) }
+            }
+        }
+    }
+
+    private func exportSpec(_ format: ExportFormat, viewer: SpecViewer, title: String, to url: URL) {
+        editor.text { [weak self] spec in
+            guard let self else { return }
+            guard let spec, let page = SpecPage.html(viewer: viewer, spec: spec, title: title, snapshot: format == .mhtml) else {
+                return self.exportFinished(url, ok: false)
+            }
+            guard format == .mhtml else { return self.write(Data(page.utf8), to: url) }
+            PageSnapshot.capture(html: page) { [weak self] snapshot in
+                guard let self else { return }
+                guard let snapshot else { return self.exportFinished(url, ok: false) }
+                MHTML.make(html: snapshot, title: title) { [weak self] data in self?.write(data, to: url) }
+            }
+        }
+    }
+
+    private func write(_ data: Data, to url: URL) {
+        do {
+            try data.write(to: url, options: .atomic)
+            exportFinished(url, ok: true)
+        } catch {
+            NSLog("ScratchPad: export failed: \(error)")
+            exportFinished(url, ok: false)
+        }
+    }
+
+    private func exportFinished(_ url: URL, ok: Bool) {
+        if ok {
+            Toast.show("Saved \(url.lastPathComponent)", in: window, actions: [
+                .init(title: "Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([url]) },
+                .init(title: "Open") { NSWorkspace.shared.open(url) },
+            ])
+        } else {
+            showMessage("Couldn't export \(url.lastPathComponent)", isError: true)
+        }
     }
 
     private func showLanguageMenu(from button: NSView) {
@@ -1078,6 +1552,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func showMessage(_ text: String, isError: Bool = false) {
+        if showsRichText || activeTool != nil {
+            // Pages have no status bar.
+            Toast.show(text, symbol: isError ? "exclamationmark.triangle.fill" : "checkmark.circle.fill",
+                       tint: isError ? .systemOrange : .systemGreen, in: window)
+            return
+        }
         editorPane.setMessage(text, isError: isError)
         messageTimer?.invalidate()
         messageTimer = Timer.scheduledTimer(withTimeInterval: isError ? 8 : 3, repeats: false) { [weak self] _ in
@@ -1148,7 +1628,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                     self.sidebar.reload(self.store.list(), select: scratch)
                     self.open(scratch)
                 }
-                self.editor.focus()
+                self.focusEditor()
+            }
+        }
+        let files = openedFiles.filter { $0 != current }.map { file in
+            PaletteItem(id: "file.\(file.id)", title: file.name, category: "Opened file · \(Self.folderDisplay(file))",
+                        keywords: file.url.path, icon: (file.language.symbolName, file.language.tint)) { [weak self] in
+                self?.show(file)
             }
         }
         let tools = DevTools.all.map { tool in
@@ -1158,7 +1644,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 self?.editor.flush { self?.openTool(tool.id) }
             }
         }
-        let items = scratchItems + tools
+        let items = scratchItems + files + tools
         let initial = ordered.first == current && ordered.count > 1 ? 1 : 0
         editor.flush { [self] in
             recentPicker.show(over: window, items: items, initialRow: initial,
@@ -1168,7 +1654,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     private func apply(_ transform: TextTransform) {
         window?.makeKeyAndOrderFront(nil)
-        editor.focus()
+        if showsRichText {
+            showMessage("Text transforms work in code and plain text scratches", isError: true)
+            return
+        }
+        focusEditor()
         switch transform.kind {
         case .insert(let generate):
             editor.insertAtCursors(generate())
@@ -1193,7 +1683,361 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
     }
 
+    // MARK: Opening files
+
+    /// Files opened from outside the scratch folder, most recent first. They aren't touched on disk here (that would
+    /// prompt for Downloads/Desktop access); ones that have gone are dropped when opening them fails.
+    private var openedFiles: [Scratch] {
+        Settings.shared.openedFiles.map { Scratch(url: URL(fileURLWithPath: $0), readAttributes: false) }
+    }
+
+    private static func folderDisplay(_ scratch: Scratch) -> String {
+        (scratch.url.deletingLastPathComponent().path as NSString).abbreviatingWithTildeInPath
+    }
+
+    /// Why a file can't be edited here, or nil when it can.
+    private static func unopenableReason(_ url: URL) -> String? {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else { return "not found" }
+        if Language(fileExtension: url.pathExtension).isRichText { return nil }
+        if isDirectory.boolValue { return "folders can't be opened" }
+        let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
+        if size > 50_000_000 { return "larger than 50 MB" }
+        guard let data = try? Data(contentsOf: url) else { return "can't be read" }
+        if data.prefix(8192).contains(0) { return "not a text file" }
+        if String(data: data, encoding: .utf8) == nil { return "not UTF-8 text" }
+        return nil
+    }
+
+    /// Opens files dropped on the Dock icon, opened from Finder, or chosen with ⌘O. Files inside the
+    /// scratch folder open as scratches; others are edited in place and remembered under Recent Scratches.
+    func openFiles(_ urls: [URL]) {
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        for url in urls where url.scheme == "scratchpad" { handleCommandURL(url) }
+        let fileURLs = urls.filter(\.isFileURL).map(\.standardizedFileURL)
+        let folders = fileURLs.filter { url in
+            var isDirectory: ObjCBool = false
+            return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) && isDirectory.boolValue
+                && !RichTextIO.isPackage(url)
+        }
+        // Folders inside the scratches folder are already in the sidebar; just show them.
+        let scratchFolders = folders.filter { relativePath($0) != nil }
+        let externalFolders = folders.filter { relativePath($0) == nil }
+        if !externalFolders.isEmpty { addExternalFolders(externalFolders, quiet: fileURLs.count > folders.count) }
+        if let id = scratchFolders.last.flatMap(relativePath) { revealFolder(id) }
+        var opened: [Scratch] = []
+        var problems: [String] = []
+        for url in fileURLs where !folders.contains(url) {
+            if let reason = Self.unopenableReason(url) {
+                problems.append("\(url.lastPathComponent) (\(reason))")
+            } else {
+                opened.append(Scratch(url: url))
+            }
+        }
+        let external = opened.filter { !$0.isListed }.map(\.url.path)
+        Settings.shared.openedFiles = external.reversed() + Settings.shared.openedFiles.filter { !external.contains($0) }
+        guard let first = opened.first else {
+            if !problems.isEmpty, folders.isEmpty {
+                Toast.show("Couldn't open \(problems.joined(separator: ", "))", symbol: "exclamationmark.triangle.fill",
+                           tint: .systemOrange, in: window)
+            }
+            return
+        }
+        editor.flush { [self] in
+            show(first)
+            var text = first.isInScratchFolder ? "Opened \(first.name)"
+                : "Opened \(first.name) from \(Self.folderDisplay(first)) — changes save to the original file"
+            if !folders.isEmpty { text += ". Added \(folders.count == 1 ? "1 folder" : "\(folders.count) folders") to the sidebar" }
+            if opened.count > 1 { text += ". \(opened.count - 1) more in Recent Scratches" }
+            if !problems.isEmpty { text += ". Couldn't open \(problems.joined(separator: ", "))" }
+            Toast.show(text, symbol: problems.isEmpty ? "doc.fill" : "exclamationmark.triangle.fill",
+                       tint: problems.isEmpty ? .systemBlue : .systemOrange, in: window)
+        }
+    }
+
+    // MARK: External folders & command line
+
+    private func revealFolder(_ id: String) {
+        if sidebarItem.isCollapsed { sidebarItem.animator().isCollapsed = false }
+        sidebar.showFolder(id)
+    }
+
+    /// Lists folders from elsewhere on disk in the sidebar (and Find in Files) without copying them.
+    func addExternalFolders(_ urls: [URL], quiet: Bool = false) {
+        var added: [String] = []
+        var problems: [String] = []
+        for url in urls {
+            do { added.append(try ExternalFolders.add(url)) } catch { problems.append(error.localizedDescription) }
+        }
+        if !added.isEmpty {
+            store.rewatch()
+            sidebar.reload(store.list(), select: current?.isListed == true ? current : nil)
+            if let last = added.last { revealFolder(last) }
+        }
+        guard !quiet else { return }
+        if !problems.isEmpty {
+            Toast.show(problems.joined(separator: " "), symbol: "exclamationmark.triangle.fill", tint: .systemOrange, in: window)
+        } else if let last = added.last {
+            let truncated = ScratchStore.truncatedExternalRoots.contains(last)
+            let text = added.count == 1
+                ? "Added \(ExternalFolders.displayPath(last)) as an external folder"
+                    + (truncated ? " (first \(ScratchStore.maxExternalFiles) files)" : "")
+                : "Added \(added.count) external folders"
+            Toast.show(text, symbol: "externaldrive.fill", tint: .systemOrange, in: window)
+        }
+    }
+
+    private func removeExternalFolder(_ root: String) {
+        editor.flush { [self] in
+            store.flushWrites()
+            ExternalFolders.remove(root)
+            store.rewatch()
+            sidebar.reload(store.list(), select: current?.isListed == true ? current : nil)
+            updateChrome()
+            Toast.show("Removed \((root as NSString).lastPathComponent) from the sidebar. The folder itself wasn't changed.",
+                       symbol: "externaldrive", tint: .systemGray, in: window)
+        }
+    }
+
+    private func showAddFolderPanel() {
+        guard let window else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        panel.prompt = "Add to Sidebar"
+        panel.message = "The folder stays where it is: its files are listed and searched, and edits save to them."
+        panel.beginSheetModal(for: window) { [weak self] response in
+            if response == .OK { self?.addExternalFolders(panel.urls) }
+        }
+    }
+
+    /// `scratchpad://import?path=…` from `command | scratchpad -`: turns the piped text into a new scratch.
+    private func handleCommandURL(_ url: URL) {
+        guard url.host == "import",
+              let path = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "path" })?.value
+        else { return }
+        let file = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
+        let temp = URL(fileURLWithPath: NSTemporaryDirectory()).standardizedFileURL.resolvingSymlinksInPath().path
+        // Only the CLI's own temp files: the URL can come from anywhere, and the file is deleted afterwards.
+        guard file.path.hasPrefix(temp + "/") || file.path.hasPrefix("/private/tmp/") || file.path.hasPrefix("/tmp/"),
+              file.lastPathComponent.hasPrefix("scratchpad-stdin.") else { return }
+        defer { try? FileManager.default.removeItem(at: file) }
+        guard let data = try? Data(contentsOf: file), !data.isEmpty else {
+            Toast.show("Nothing was piped to scratchpad", symbol: "exclamationmark.triangle.fill", tint: .systemOrange, in: window)
+            return
+        }
+        let text = String(decoding: data, as: UTF8.self)
+        editor.flush { [self] in
+            if let scratch = createScratch(Language.detect(text), content: text, in: "") {
+                if scratch.language.isTable, Settings.shared.previewMode == .off { setPreview(.split) }
+                Toast.show("Created \(scratch.name) from piped text", symbol: "terminal.fill", tint: .systemGreen, in: window)
+            }
+        }
+    }
+
+    /// Links /usr/local/bin/scratchpad to the script inside the app (asking for an admin password if needed).
+    private func installCommandLineTool() {
+        guard let window else { return }
+        guard let script = Bundle.main.url(forResource: "scratchpad", withExtension: nil, subdirectory: "bin") else {
+            presentError(ScratchStore.error("The command line tool is missing from the app bundle. Rebuild the app."))
+            return
+        }
+        let target = "/usr/local/bin/scratchpad"
+        let alert = NSAlert()
+        alert.messageText = "Install the “scratchpad” command?"
+        alert.informativeText = """
+            Creates \(target), linked to this app. Then, in Terminal:
+
+              scratchpad notes.md         open a file
+              scratchpad ~/work/project   add a folder to the sidebar
+              pbpaste | scratchpad -      open piped text as a new scratch
+            """
+        alert.addButton(withTitle: "Install")
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: window) { [self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            let fm = FileManager.default
+            do {
+                try fm.createDirectory(atPath: "/usr/local/bin", withIntermediateDirectories: true)
+                if (try? fm.destinationOfSymbolicLink(atPath: target)) != nil || fm.fileExists(atPath: target) {
+                    try fm.removeItem(atPath: target)
+                }
+                try fm.createSymbolicLink(atPath: target, withDestinationPath: script.path)
+            } catch {
+                let quoted = { (s: String) in "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+                let command = "mkdir -p /usr/local/bin && ln -sf \(quoted(script.path)) \(quoted(target))"
+                let source = "do shell script \"\(command.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\""))\" with administrator privileges"
+                var scriptError: NSDictionary?
+                NSAppleScript(source: source)?.executeAndReturnError(&scriptError)
+                if let scriptError {
+                    if (scriptError[NSAppleScript.errorNumber] as? Int) == -128 { return }
+                    presentError(ScratchStore.error("Couldn't install \(target): \(scriptError[NSAppleScript.errorMessage] ?? "unknown error")"))
+                    return
+                }
+            }
+            Toast.show("Installed. Run “scratchpad <file or folder>” in Terminal", symbol: "terminal.fill", tint: .systemGreen, in: window)
+        }
+    }
+
+    /// Opens Find in Files limited to a folder ("" for every scratch).
+    private func findInFolder(_ id: String) {
+        editor.flush { [self] in
+            findInScratches.show(over: window, query: nil, location: folderURL(forId: id).standardizedFileURL.path)
+        }
+    }
+
+    private func showOpenPanel() {
+        guard let window else { return }
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.message = "Files open in place: changes are saved to the original file."
+        panel.beginSheetModal(for: window) { [weak self] response in
+            if response == .OK { self?.openFiles(panel.urls) }
+        }
+    }
+
+    /// Opens a scratch or file (selecting it in the list when it's a scratch), optionally at a line.
+    private func show(_ scratch: Scratch, line: Int? = nil) {
+        window?.makeKeyAndOrderFront(nil)
+        if scratch != current || isDiffing || activeTool != nil {
+            sidebar.reload(store.list(), select: scratch.isListed ? scratch : nil)
+            open(scratch)
+        }
+        if let line, line > 0, !scratch.language.isRichText {
+            editor.text { [weak self] text in
+                guard let self, let text else { return }
+                let ns = text as NSString
+                var offset = 0
+                for _ in 1..<line {
+                    let next = ns.range(of: "\n", range: NSRange(location: offset, length: ns.length - offset))
+                    guard next.location != NSNotFound else { break }
+                    offset = next.location + 1
+                }
+                self.editor.reveal(NSRange(location: offset, length: 0))
+            }
+        }
+        focusEditor()
+    }
+
+    /// ⇧⌘O: IntelliJ-style "Go to File" over every scratch, opened file and folder.
+    private func showGotoScratch() {
+        let all = store.list()
+        let byId = Dictionary(all.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        var ordered = Settings.shared.recentScratches.compactMap { byId[$0] }
+        ordered += all.filter { !ordered.contains($0) }.sorted { $0.modified > $1.modified }
+        // With an empty query the open scratch goes last: you're looking for something else.
+        if let current, let index = ordered.firstIndex(of: current) { ordered.append(ordered.remove(at: index)) }
+        let picker = gotoPicker
+        func lineInQuery() -> Int? { FuzzyMatcher.splitLine(picker.query).line }
+        var items = ordered.map { scratch in
+            PaletteItem(id: "goto.\(scratch.id)", title: scratch.name,
+                        category: scratch.folder.isEmpty ? (scratch == current ? "current" : "") : scratch.folder,
+                        keywords: scratch.folder, icon: (scratch.language.symbolName, scratch.language.tint)) { [weak self] in
+                self?.show(scratch, line: lineInQuery())
+            }
+        }
+        items += openedFiles.map { file in
+            PaletteItem(id: "goto.file.\(file.id)", title: file.name, category: Self.folderDisplay(file),
+                        keywords: file.url.deletingLastPathComponent().path,
+                        icon: (file.language.symbolName, file.language.tint)) { [weak self] in
+                self?.show(file, line: lineInQuery())
+            }
+        }
+        items += ScratchStore.folders().map { folder in
+            PaletteItem(id: "goto.folder.\(folder.id)", title: folder.name,
+                        category: folder.parent.isEmpty ? "folder" : "folder in \(folder.parent)",
+                        keywords: folder.parent, icon: ("folder.fill", .systemBlue)) { [weak self] in
+                guard let self else { return }
+                if self.sidebarItem.isCollapsed { self.sidebarItem.animator().isCollapsed = false }
+                self.sidebar.showFolder(folder.id)
+            }
+        }
+        picker.matcher = { item, query in
+            let penalty = item.id.hasPrefix("goto.folder.") ? 30 : item.id.hasPrefix("goto.file.") ? 10 : 0
+            return FuzzyMatcher.match(query: FuzzyMatcher.splitLine(query).name, name: item.title, folder: item.keywords)
+                .map { ($0.score - penalty, $0.positions) }
+        }
+        editor.flush { [self] in
+            picker.show(over: window, items: items)
+        }
+    }
+
+    // MARK: Go to Symbol
+
+    /// ⌘[: the open file's outline — classes, functions, keys, headings… — fuzzy-searchable, previewed as you move.
+    private func showGotoSymbol() {
+        guard let scratch = current, activeTool == nil, !isDiffing else { return NSSound.beep() }
+        if showsRichText {
+            presentSymbols(richPage.symbols(), cursor: richPage.cursorLocation, truncated: false, in: scratch, rich: true)
+        } else {
+            editor.symbols { [weak self] symbols, cursor, truncated in
+                self?.presentSymbols(symbols, cursor: cursor, truncated: truncated, in: scratch, rich: false)
+            }
+        }
+    }
+
+    private func presentSymbols(_ symbols: [DocumentSymbol], cursor: Int, truncated: Bool, in scratch: Scratch, rich: Bool) {
+        guard current == scratch, activeTool == nil else { return }
+        guard !symbols.isEmpty else {
+            if !rich { editor.endSymbolPeek(select: nil) }
+            return showMessage("No symbols in \(scratch.name)")
+        }
+        let items = symbols.enumerated().map { index, symbol in
+            let where_ = [symbol.detail, symbol.container.isEmpty ? "" : "in \(symbol.container)", "\(symbol.line)"]
+            var item = PaletteItem(id: "symbol.\(index)", title: symbol.name,
+                                   category: where_.filter { !$0.isEmpty }.joined(separator: "  ·  "),
+                                   keywords: symbol.container, icon: symbol.tile) { [weak self] in
+                guard let self else { return }
+                if rich { self.richPage.select(symbol.range) } else { self.editor.endSymbolPeek(select: symbol.range) }
+            }
+            item.indent = symbol.depth
+            return item
+        }
+        let picker = symbolPicker
+        picker.placeholder = truncated
+            ? "Symbols in \(scratch.name) (first \(symbols.count.formatted())) — @kind filters, Class/member narrows"
+            : "Symbols in \(scratch.name) — @kind filters (@method, @key…), Class/member narrows"
+        // "@method get" keeps methods matching "get"; "User/save" matches save inside User.
+        picker.matcher = { item, query in
+            guard let index = Int(item.id.dropFirst("symbol.".count)), symbols.indices.contains(index) else { return nil }
+            let symbol = symbols[index]
+            var text = query
+            if text.hasPrefix("@") {
+                let parts = text.dropFirst().split(separator: " ", maxSplits: 1)
+                let kind = parts.first.map { $0.lowercased() } ?? ""
+                guard kind.isEmpty || symbol.kindLabel.lowercased().hasPrefix(kind) || symbol.kind.lowercased().hasPrefix(kind) else { return nil }
+                text = parts.count > 1 ? String(parts[1]) : ""
+            }
+            // Names can hold "/" themselves (OpenAPI routes "/v1/{id}/charges", "GET /pets"): match them whole first.
+            if text.contains("/"), let whole = FuzzyMatcher.subsequence(text.filter { $0 != " " && $0 != "*" }.lowercased(), in: symbol.name) {
+                return (whole.score, whole.positions)
+            }
+            return FuzzyMatcher.match(query: text, name: symbol.name, folder: symbol.container)
+        }
+        picker.onHighlight = { [weak self] item in
+            guard let self, let index = Int(item.id.dropFirst("symbol.".count)), symbols.indices.contains(index) else { return }
+            if rich { self.richPage.peek(symbols[index].range) } else { self.editor.peekSymbol(at: symbols[index].range.location) }
+        }
+        picker.onDismiss = { [weak self] accepted in
+            if !accepted, !rich { self?.editor.endSymbolPeek(select: nil) }
+        }
+        // Start on the innermost symbol around the cursor, like IntelliJ's file structure.
+        let initial = symbols.indices.last { symbols[$0].range.location <= cursor && cursor <= symbols[$0].end }
+            ?? symbols.indices.last { symbols[$0].range.location <= cursor } ?? 0
+        picker.show(over: window, items: items, initialRow: initial, cycleKey: KeymapStore.shared.key(for: "gotoSymbol"))
+    }
+
     // MARK: Action dispatch
+
+    /// Runs an action from one of its extra shortcuts (menus only carry the primary one); false when unavailable.
+    func performShortcut(_ id: String) -> Bool {
+        guard window?.isKeyWindow == true, window?.attachedSheet == nil, isEnabled(id) else { return false }
+        perform(id)
+        return true
+    }
 
     @objc func performAction(_ sender: Any?) {
         let id = ((sender as? NSMenuItem)?.representedObject as? String)
@@ -1201,10 +2045,52 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         if let id { perform(id) }
     }
 
+    /// Format menu actions and the rich text page command each one runs.
+    private static let richFormatActions: [String: String] = [
+        "formatBold": "bold", "formatItalic": "italic", "formatUnderline": "underline",
+        "formatStrikethrough": "strikethrough", "formatAlignLeft": "alignLeft", "formatAlignCenter": "alignCenter",
+        "formatAlignRight": "alignRight", "formatJustify": "alignJustified", "formatBulletList": "bulletList",
+        "formatNumberedList": "numberedList", "formatFonts": "fonts", "formatClear": "clearFormatting",
+        "formatInsertImage": "insertImage", "formatBigger": "bigger", "formatSmaller": "smaller",
+    ]
+
+    /// Editor commands for a rich text page; true when handled (or deliberately ignored).
+    private func performOnRichPage(_ id: String) -> Bool {
+        switch id {
+        case "find": richPage.performFind(.showFindInterface)
+        case "findNext": richPage.performFind(.nextMatch)
+        case "findPrevious": richPage.performFind(.previousMatch)
+        case "zoomIn": richPage.zoom(0.1)
+        case "zoomOut": richPage.zoom(-0.1)
+        case "zoomReset": richPage.zoom(nil)
+        default:
+            // Code-editor commands (duplicate line, multi-cursor…) have no meaning here.
+            guard Actions.byId[id]?.scope == .editor else { return false }
+            NSSound.beep()
+        }
+        return true
+    }
+
     func perform(_ id: String) {
+        if let command = Self.richFormatActions[id] {
+            if showsRichText { richPage.run(command) } else { NSSound.beep() }
+            return
+        }
+        if showsRichText, performOnRichPage(id) { return }
         let selection = sidebar.selectedScratches
         switch id {
         case "newScratch": showNewScratchMenu()
+        case "gotoScratch": showGotoScratch()
+        case "openFile": showOpenPanel()
+        case "addExternalFolder": showAddFolderPanel()
+        case "installCLI": installCommandLineTool()
+        case "copyRichText": editor.copyRichText()
+        case "exportPreview": showExportPopover()
+        case "exportPreviewPDF": exportPreview(.pdf)
+        case "exportPreviewHTML": exportPreview(.html)
+        case "exportPreviewMHTML": exportPreview(.mhtml)
+        case "specViewerSwagger", "specViewerScalar", "specViewerKong":
+            if let viewer = SpecViewer.allCases.first(where: { $0.actionId == id }) { setSpecViewer(viewer) }
         case "newFromClipboard":
             let text = NSPasteboard.general.string(forType: .string) ?? ""
             if Curl.looksLikeCurl(text), let converted = try? Curl.toHTTP(text, indent: Settings.shared.tabSize) {
@@ -1217,17 +2103,26 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                                symbol: "exclamationmark.triangle.fill", tint: .systemOrange, in: window)
                 }
             } else if let scratch = createScratch(Language.detect(text), content: text) {
+                if scratch.language.isTable, Settings.shared.previewMode == .off { setPreview(.split) }
                 Toast.show("Created \(scratch.name) from clipboard", in: window)
             }
         case "renameScratch": beginRename()
-        case "deleteScratch": if let current, current.isInScratchFolder { delete([current]) }
+        case "deleteScratch": if let current, current.isListed { delete([current]) }
         case "openSharedPackages": openSharedPackages()
         case "installSharedPackages": installSharedPackages()
         case "chooseJDK": showJDKMenu(from: jdkButton)
         case "copyPath": if let current { copyPath([current]) }
         case "copyFile": if let current { copyFiles([current]) }
         case "revealScratch": if let url = current?.url { NSWorkspace.shared.activateFileViewerSelecting([url]) }
-        case "revealInSidebar": revealInSidebar()
+        case "revealInSidebar":
+            // Like IntelliJ's ⌘1: a second press, while the list has focus, hides it again.
+            if sidebarHasFocus {
+                sidebarItem.animator().isCollapsed = true
+                focusEditor()
+            } else {
+                revealInSidebar()
+            }
+        case "editorOnly": toggleEditorOnly()
         case "compareWithClipboard": compareWithClipboard()
         case "nextScratch": step(1)
         case "previousScratch": step(-1)
@@ -1235,6 +2130,21 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         case "recentScratches": showRecentScratches()
         case "navigateBack": navigate(back: true)
         case "navigateForward": navigate(back: false)
+        case "save": saveNow()
+        case "gotoSymbol": showGotoSymbol()
+        case "closeTab":
+            if activeTool != nil, current != nil {
+                navigate(back: true)
+            } else if activeTool != nil {
+                closeTool()
+                updateChrome()
+            } else if let current {
+                closeTabs { $0 == current }
+            }
+        case "closeOtherTabs": if let current { closeTabs { $0 != current } }
+        case "closeAllTabs": closeTabs { _ in true }
+        case "nextTab": stepTab(1)
+        case "previousTab": stepTab(-1)
         case "sidebarCompare": compare(selection)
         case "sidebarCopyFile": copyFiles(selection)
         case "sidebarDelete": delete(selection)
@@ -1251,6 +2161,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         case "httpOpenResponse": openLastResponse()
         case "toggleSidebar": sidebarItem.animator().isCollapsed.toggle()
         case "toggleConsole": showConsole(consoleItem.isCollapsed)
+        case "toggleConsolePosition": toggleConsolePosition()
         case "clearConsole": console.clear()
         case "toggleWrap": Settings.shared.lineWrap.toggle()
         case "togglePreview":
@@ -1259,9 +2170,16 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         case "groupByType": sidebar.toggleGrouping(.type)
         case "groupByDate": sidebar.toggleGrouping(.date)
         case "toggleFoldersPane": toggleFoldersPane()
-        case "zoomIn": Settings.shared.fontSize += 1
-        case "zoomOut": Settings.shared.fontSize -= 1
-        case "zoomReset": Settings.shared.fontSize = Settings.defaultFontSize
+        case "zoomIn", "zoomOut", "zoomReset":
+            let step = id == "zoomIn" ? 1 : id == "zoomOut" ? -1 : 0
+            editor.zoomPreview(step) { handled in
+                guard !handled else { return }
+                switch step {
+                case 1: Settings.shared.fontSize += 1
+                case -1: Settings.shared.fontSize -= 1
+                default: Settings.shared.fontSize = Settings.defaultFontSize
+                }
+            }
         default:
             if Actions.byId[id]?.scope == .editor { editor.exec(id) }
         }
@@ -1273,9 +2191,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     ]
 
     private func isEnabled(_ id: String) -> Bool {
-        if activeTool != nil {
+        if Self.richFormatActions[id] != nil { return showsRichText }
+        if showsRichText {
+            if Actions.byId[id]?.scope == .editor { return ["find", "findNext", "findPrevious"].contains(id) }
+            if ["toggleWrap", "compareWithClipboard"].contains(id) { return false }
+        }
+        if activeTool != nil || current == nil {
             if Self.scratchOnlyActions.contains(id) { return false }
-            if id == "revealInSidebar" || id == "navigateBack" { return true }
+            if id == "revealInSidebar" { return activeTool != nil || sidebarHasFocus }
+            if activeTool == nil, Actions.byId[id]?.scope == .editor || id == "toggleWrap" { return false }
         }
         let lang = current?.language
         switch id {
@@ -1284,14 +2208,25 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         case "run": return ((lang?.canRun ?? false) || current?.isSharedManifest == true) && !runner.isRunning && !http.isRunning
         case "installSharedPackages": return !runner.isRunning
         case "stop": return runner.isRunning || http.isRunning
-        case "navigateBack": return !backStack.isEmpty
-        case "navigateForward": return !forwardStack.isEmpty
+        case "navigateBack": return canNavigate.back
+        case "navigateForward": return canNavigate.forward
+        case "save": return current != nil && activeTool == nil
+        case "gotoSymbol": return current != nil && activeTool == nil && !isDiffing
+        case "closeTab": return current != nil || activeTool != nil
+        case "closeOtherTabs": return current != nil && tabs.count > 1
+        case "closeAllTabs": return !tabs.isEmpty
+        case "nextTab", "previousTab": return tabs.count > 1 || (activeTool != nil && !tabs.isEmpty)
         case "httpRunAll", "httpCopyCurl": return lang == .http
         case "httpOpenResponse": return http.lastResponse != nil
-        case "togglePreview": return (lang?.canPreview ?? false) || lang == .diff
-        case "fullPreview": return lang?.canPreview ?? false
-        case "renameScratch", "revealInSidebar", "deleteScratch":
-            return current?.isInScratchFolder ?? false
+        case "togglePreview": return (current != nil && editor.previewAvailable) || lang == .diff
+        case "fullPreview": return current != nil && editor.previewAvailable
+        case "copyRichText": return lang == .markdown && activeTool == nil
+        case "exportPreview", "exportPreviewHTML", "exportPreviewMHTML": return exportKind != nil
+        case "exportPreviewPDF": return exportKind == "markdown"
+        case "specViewerSwagger", "specViewerScalar", "specViewerKong": return exportKind == "openapi"
+        case "revealInSidebar": return current?.isListed == true || sidebarHasFocus
+        case "renameScratch", "deleteScratch":
+            return current?.isListed ?? false
         case "revealScratch", "copyPath", "copyFile", "compareWithClipboard":
             return current != nil
         default: return true
@@ -1299,7 +2234,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     }
 
     @objc func changeLanguageFromMenu(_ sender: NSMenuItem) {
-        changeLanguage(to: Language.allCases[sender.tag])
+        let language = Language.allCases[sender.tag]
+        if language == .text, let current { explicitPlainText.insert(current.id) }
+        changeLanguage(to: language)
     }
 
     @objc private func contextAction(_ sender: NSMenuItem) {
@@ -1320,6 +2257,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         if current?.language == .java { updateJDKButton() }
         editor.applySettings()
         console.updateFont()
+        applyConsolePosition()
     }
 
     @objc private func keymapChanged() {
@@ -1351,6 +2289,8 @@ extension MainWindowController: NSMenuItemValidation, NSToolbarItemValidation {
             return current != nil
         }
         if menuItem.action == #selector(performAction(_:)), let id = menuItem.representedObject as? String {
+            // A popup (Go to Symbol, Find Action…) is key: its search field gets ⌘⌫ and friends, not the editor.
+            if NSApp.keyWindow is PopupPanel { return false }
             switch id {
             case "toggleWrap": menuItem.state = Settings.shared.lineWrap ? .on : .off
             case "groupByType": menuItem.state = sidebar.grouping == .type ? .on : .off
@@ -1358,6 +2298,8 @@ extension MainWindowController: NSMenuItemValidation, NSToolbarItemValidation {
             case "toggleFoldersPane": menuItem.state = sidebar.isFoldersPane ? .on : .off
             case "togglePreview": menuItem.state = Settings.shared.previewMode == .split && isEnabled(id) ? .on : .off
             case "fullPreview": menuItem.state = Settings.shared.previewMode == .full && isEnabled(id) ? .on : .off
+            case "specViewerSwagger", "specViewerScalar", "specViewerKong":
+                menuItem.state = Settings.shared.specViewer.actionId == id ? .on : .off
             default: break
             }
             return isEnabled(id)
@@ -1419,13 +2361,15 @@ extension MainWindowController: NSToolbarDelegate {
         }
         languageButton.onClick = { [weak self] button in self?.showLanguageMenu(from: button) }
         jdkButton.onClick = { [weak self] button in self?.showJDKMenu(from: button) }
-        editorPane.setHeaderControls([languageButton, previewGroup, jdkButton, packagesGroup])
+        viewerButton.onClick = { [weak self] button in self?.showViewerMenu(from: button) }
+        editorPane.setHeaderControls([languageButton, previewGroup, viewerButton, exportButton, jdkButton, packagesGroup])
         updateToolbarTips()
 
-        let toolbar = NSToolbar(identifier: "ScratchPad.toolbar.v3")
+        let toolbar = NSToolbar(identifier: "ScratchPad.toolbar.v4")
         toolbar.delegate = self
         toolbar.displayMode = .iconOnly
         toolbar.allowsUserCustomization = false
+        if #available(macOS 15.0, *) { toolbar.allowsDisplayModeCustomization = false }
         window?.toolbar = toolbar
     }
 
@@ -1449,7 +2393,17 @@ extension MainWindowController: NSToolbarDelegate {
     }
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.sidebarToggle, .sidebarTrackingSeparator, .title, .flexibleSpace, .codeGroup, .fileGroup, .toolsGroup]
+        if #available(macOS 26.0, *) {
+            // Spaces keep each group in a glass capsule of its own.
+            return [.sidebarToggle, .sidebarTrackingSeparator, .tabs, .codeGroup, .space, .fileGroup, .space, .toolsGroup]
+        }
+        return [.sidebarToggle, .sidebarTrackingSeparator, .tabs, .codeGroup, .fileGroup, .toolsGroup]
+    }
+
+    private func toolbarGroup(_ ids: [String]) -> ToolbarGroup {
+        let views = ids.compactMap { toolbarButtons[$0] }
+        if #available(macOS 26.0, *) { return ToolbarGroup(views, bare: true) }
+        return ToolbarGroup(views)
     }
 
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
@@ -1463,17 +2417,22 @@ extension MainWindowController: NSToolbarDelegate {
         case .sidebarToggle:
             item.view = toolbarButtons["toggleSidebar"]
             item.label = "Sidebar"
-        case .title:
-            item.view = titleField
-            item.label = "File"
+        case .tabs:
+            // Takes all the room between the sidebar and the buttons, like a search field would.
+            item.view = tabBar
+            // No glass capsule behind the tabs (macOS 26 gives custom-view items one by default).
+            item.isBordered = false
+            item.minSize = NSSize(width: 160, height: Self.tabBarHeight)
+            item.maxSize = NSSize(width: 10_000, height: Self.tabBarHeight)
+            item.label = "Tabs"
         case .codeGroup:
-            item.view = ToolbarGroup(["format", "run", "stop"].compactMap { toolbarButtons[$0] })
+            item.view = toolbarGroup(["format", "run", "stop"])
             item.label = "Code"
         case .fileGroup:
-            item.view = ToolbarGroup(["copyPath", "copyFile"].compactMap { toolbarButtons[$0] })
+            item.view = toolbarGroup(["copyPath", "copyFile"])
             item.label = "File"
         case .toolsGroup:
-            item.view = ToolbarGroup(["commandPalette", "toggleConsole"].compactMap { toolbarButtons[$0] })
+            item.view = toolbarGroup(["commandPalette", "toggleConsole"])
             item.label = "Tools"
         default:
             return nil
@@ -1492,11 +2451,14 @@ extension MainWindowController: EditorControllerDelegate {
     func editorDidBecomeReady(_ editor: EditorController) {
         // Also runs after a web content crash + reload; restore whatever is on screen.
         editor.setPreview(Settings.shared.previewMode)
-        if let current { editor.load(id: current.id, text: store.read(current), language: current.language) }
+        if let current, !current.language.isRichText {
+            editor.load(id: current.id, text: store.read(current), language: current.language)
+        }
     }
 
     func editor(_ editor: EditorController, didChange id: String, text: String) {
-        guard let scratch = sidebar.scratches.first(where: { $0.id == id }) ?? (current?.id == id ? current : nil) else { return }
+        guard let scratch = sidebar.scratches.first(where: { $0.id == id }) ?? (current?.id == id ? current : nil)
+            ?? externalById[id] else { return }
         store.save(scratch, text: text)
     }
 
@@ -1505,7 +2467,7 @@ extension MainWindowController: EditorControllerDelegate {
     }
 
     func editor(_ editor: EditorController, didPasteIntoEmpty id: String) {
-        guard current?.id == id else { return }
+        guard current?.id == id, !explicitPlainText.contains(id) else { return }
         editor.text { [self] text in
             guard let text, current?.id == id else { return }
             if Curl.looksLikeCurl(text), let converted = try? Curl.toHTTP(text, indent: Settings.shared.tabSize) {
@@ -1514,11 +2476,21 @@ extension MainWindowController: EditorControllerDelegate {
                 showMessage("Converted cURL to an HTTP request")
                 return
             }
-            let detected = Language.detect(text)
-            if detected != .text, detected != current?.language {
-                changeLanguage(to: detected)
-                showMessage("Detected \(detected.displayName)")
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let detected = Language.detect(text)
+                DispatchQueue.main.async { self?.applyDetected(detected, to: id) }
             }
+        }
+    }
+
+    private func applyDetected(_ detected: Language, to id: String) {
+        guard current?.id == id, activeTool == nil, detected != .text, detected != current?.language else { return }
+        changeLanguage(to: detected)
+        if detected.isTable, Settings.shared.previewMode == .off {
+            setPreview(.split)
+            showMessage("Detected \(detected.displayName) — showing it as a table")
+        } else {
+            showMessage("Detected \(detected.displayName)")
         }
     }
 
@@ -1543,6 +2515,10 @@ extension MainWindowController: EditorControllerDelegate {
         showMessage("Opened response as a \(language.displayName) scratch")
     }
 
+    func editor(_ editor: EditorController, showMessage text: String) {
+        showMessage(text)
+    }
+
     func editorDidCloseDiff(_ editor: EditorController) {
         isDiffing = false
         editorPane.setMessage("", isError: false)
@@ -1565,6 +2541,7 @@ extension MainWindowController: SidebarDelegate {
     }
 
     func sidebar(_ sidebar: SidebarViewController, perform actionId: String) {
+        if actionId == "revealInSidebar" { return revealInSidebar() }
         perform(actionId)
     }
 
@@ -1580,6 +2557,10 @@ extension MainWindowController: SidebarDelegate {
         move(scratches, folders: folders, to: folder)
     }
 
+    func sidebar(_ sidebar: SidebarViewController, addExternalFolders urls: [URL]) {
+        addExternalFolders(urls)
+    }
+
     func sidebarFolderMenu(_ sidebar: SidebarViewController, for folder: ScratchFolder?) -> NSMenu {
         let menu = NSMenu()
         func add(_ title: String, _ symbol: String? = nil, _ handler: @escaping () -> Void) {
@@ -1590,40 +2571,52 @@ extension MainWindowController: SidebarDelegate {
         guard let folder else {
             add("New Scratch…", "square.and.pencil") { [weak self] in self?.showNewScratchMenu(in: "") }
             add("New Folder", "folder.badge.plus") { [weak self] in self?.createFolder(in: "") }
+            menu.addItem(.separator())
+            add("Add Folder to Sidebar…", "externaldrive.badge.plus") { [weak self] in self?.showAddFolderPanel() }
+            add("Find in Files…", "magnifyingglass") { [weak self] in self?.findInFolder("") }
             return menu
         }
-        add("New Scratch Here…", "square.and.pencil") { [weak self] in self?.showNewScratchMenu(in: folder.id) }
+        add(folder.isExternal ? "New File Here…" : "New Scratch Here…", "square.and.pencil") { [weak self] in
+            self?.showNewScratchMenu(in: folder.id)
+        }
         add("New Folder Inside", "folder.badge.plus") { [weak self] in self?.createFolder(in: folder.id) }
+        add("Find in This Folder…", "magnifyingglass") { [weak self] in self?.findInFolder(folder.id) }
         menu.addItem(.separator())
-        add("Rename…") { [weak self] in self?.sidebar.beginRename(folder) }
+        if !folder.isExternalRoot { add("Rename…") { [weak self] in self?.sidebar.beginRename(folder) } }
         add("Reveal in Finder") { NSWorkspace.shared.activateFileViewerSelecting([folder.url]) }
         add("Copy Path") {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(folder.url.path, forType: .string)
         }
-        if !folder.parent.isEmpty || !ScratchStore.folders().filter({ $0 != folder && !folder.contains($0.id) }).isEmpty {
-            menu.addItem(moveMenu(excluding: folder.parent, skip: { $0 == folder || folder.contains($0.id) }) { [weak self] target in
-                self?.move([], folders: [folder], to: target)
-            })
+        if folder.isExternalRoot {
+            menu.addItem(.separator())
+            add("Remove from Sidebar", "minus.circle") { [weak self] in self?.removeExternalFolder(folder.id) }
+            return menu
         }
+        let move = moveMenu(excluding: folder.parent, root: folder.storageRoot,
+                            skip: { $0 == folder || folder.contains($0.id) }) { [weak self] target in
+            self?.move([], folders: [folder], to: target)
+        }
+        if move.isEnabled { menu.addItem(move) }
         menu.addItem(.separator())
         add("Move Folder to Trash", "trash") { [weak self] in self?.deleteFolder(folder) }
         return menu
     }
 
-    /// "Move to" submenu listing the top level and every folder except `current`.
-    private func moveMenu(excluding current: String, skip: (ScratchFolder) -> Bool = { _ in false },
+    /// "Move to" submenu listing the folders of one tree (`root`: "" for the scratches folder, else an external
+    /// folder) except `current`; the scratches tree also offers the top level.
+    private func moveMenu(excluding current: String, root: String, skip: (ScratchFolder) -> Bool = { _ in false },
                           action: @escaping (String) -> Void) -> NSMenuItem {
         let item = NSMenuItem(title: "Move to", action: nil, keyEquivalent: "")
         let submenu = NSMenu()
-        if !current.isEmpty {
+        if root.isEmpty, !current.isEmpty {
             let top = ClosureMenuItem(title: "Top Level") { action("") }
             top.image = NSImage(systemSymbolName: "tray", accessibilityDescription: nil)
             submenu.addItem(top)
             submenu.addItem(.separator())
         }
-        for folder in ScratchStore.folders() where folder.id != current && !skip(folder) {
-            let depth = folder.id.filter { $0 == "/" }.count
+        for folder in ScratchStore.folders() where folder.storageRoot == root && folder.id != current && !skip(folder) {
+            let depth = (root.isEmpty ? Substring(folder.id) : folder.id.dropFirst(root.count)).filter { $0 == "/" }.count
             let entry = ClosureMenuItem(title: folder.name) { action(folder.id) }
             entry.indentationLevel = depth
             entry.image = NSImage(systemSymbolName: "folder", accessibilityDescription: nil)
@@ -1665,9 +2658,12 @@ extension MainWindowController: SidebarDelegate {
             menu.addItem(.separator())
         }
         let sameFolder = Set(scratches.map(\.folder)).count == 1 ? scratches[0].folder : "\u{0}"
-        let hasTargets = sameFolder != "" || !ScratchStore.folders().isEmpty
-        if hasTargets {
-            menu.addItem(moveMenu(excluding: sameFolder) { [weak self] target in self?.move(scratches, folders: [], to: target) })
+        let roots = Set(scratches.map(\.storageRoot))
+        let move = moveMenu(excluding: sameFolder, root: roots.first ?? "") { [weak self] target in
+            self?.move(scratches, folders: [], to: target)
+        }
+        if roots.count == 1, move.isEnabled {
+            menu.addItem(move)
             let newFolder = ClosureMenuItem(title: "New Folder with Selection") { [weak self] in
                 guard let self else { return }
                 do {
@@ -1693,17 +2689,19 @@ extension MainWindowController: SidebarDelegate {
 extension MainWindowController: FindInScratchesDelegate {
     func scratchesToSearch(_ controller: FindInScratchesController) -> [Scratch] {
         store.flushWrites()
-        return store.list()
+        let listed = store.list()
+        return listed + openedFiles.filter { !listed.contains($0) }
     }
 
     func findInScratches(_ controller: FindInScratchesController, open match: ScratchMatch) {
         window?.makeKeyAndOrderFront(nil)
-        if match.scratch != current || isDiffing {
-            sidebar.reload(store.list(), select: match.scratch)
+        if match.scratch != current || isDiffing || activeTool != nil {
+            sidebar.reload(store.list(), select: match.scratch.isListed ? match.scratch : nil)
             open(match.scratch)
         }
-        editor.reveal(match.range)
-        editor.focus()
+        guard current == match.scratch else { return }
+        if showsRichText { richPage.reveal(match.range) } else { editor.reveal(match.range) }
+        focusEditor()
     }
 }
 
@@ -1722,6 +2720,11 @@ extension MainWindowController: RunnerDelegate {
 
 final class EditorPaneViewController: NSViewController {
     var webView: NSView!
+    var tabStrip: NSView? {
+        get { (view as? TabBackdropView)?.strip }
+        set { _ = view; (view as? TabBackdropView)?.strip = newValue }
+    }
+    private let headerDivider = NSBox()
     var onPositionClick: (() -> Void)?
     var onLanguageClick: ((NSView) -> Void)?
     /// A breadcrumb was clicked: its index (the file name is last) and the view to anchor a menu to.
@@ -1747,7 +2750,7 @@ final class EditorPaneViewController: NSViewController {
         editorViews.forEach { $0.isHidden = newPage != nil }
         guard let newPage else { return }
         newPage.translatesAutoresizingMaskIntoConstraints = false
-        content.insertArrangedSubview(newPage, at: 2)
+        content.insertArrangedSubview(newPage, at: (content.arrangedSubviews.firstIndex(of: headerDivider) ?? 1) + 1)
         newPage.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
         newPage.setContentHuggingPriority(.init(1), for: .vertical)
     }
@@ -1760,6 +2763,7 @@ final class EditorPaneViewController: NSViewController {
 
     func setPath(_ location: [String], name: String) {
         pathStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        guard !name.isEmpty else { return }
         for (index, part) in (location + [name]).enumerated() {
             let isFile = index == location.count
             if index > 0 {
@@ -1806,7 +2810,6 @@ final class EditorPaneViewController: NSViewController {
         header.spacing = 8
         header.edgeInsets = NSEdgeInsets(top: 0, left: 8, bottom: 0, right: 8)
         header.heightAnchor.constraint(equalToConstant: 32).isActive = true
-        let headerDivider = NSBox()
         headerDivider.boxType = .separator
 
         let stack = content
@@ -1820,7 +2823,7 @@ final class EditorPaneViewController: NSViewController {
         }
         webView.setContentHuggingPriority(.init(1), for: .vertical)
         stack.setHuggingPriority(.init(1), for: .vertical)
-        let root = NSView()
+        let root = TabBackdropView()
         root.addSubview(stack)
         stack.translatesAutoresizingMaskIntoConstraints = false
         // The window's content runs under the toolbar; keep the header below it.
@@ -1841,6 +2844,7 @@ final class EditorPaneViewController: NSViewController {
         var text = "Ln \(s.line), Col \(s.column)"
         if s.cursors > 1 { text += "  ·  \(s.cursors) carets" }
         if s.selected > 0 { text += "  ·  \(s.selected) selected" }
+        guard positionButton.title != text else { return }
         positionButton.title = text
         positionButton.invalidateIntrinsicContentSize()
     }
@@ -1859,5 +2863,66 @@ final class EditorPaneViewController: NSViewController {
         messageIcon.image = NSImage(systemSymbolName: isError ? "exclamationmark.triangle.fill" : "checkmark.circle.fill",
                                     accessibilityDescription: nil)
         messageIcon.contentTintColor = isError ? .systemRed : .systemGreen
+    }
+}
+
+/// Shown in place of the editor once every tab is closed.
+final class EmptyEditorPage: NSView {
+    private static let actions = [("New Scratch", "newScratch"), ("Go to Scratch…", "gotoScratch"), ("Recent…", "recentScratches")]
+    private let perform: (String) -> Void
+
+    init(perform: @escaping (String) -> Void) {
+        self.perform = perform
+        super.init(frame: .zero)
+        let icon = NSImageView(image: NSImage(systemSymbolName: "square.on.square.dashed", accessibilityDescription: nil)!
+            .withSymbolConfiguration(.init(pointSize: 40, weight: .light))!)
+        icon.contentTintColor = .tertiaryLabelColor
+        let title = NSTextField.label("No Open Scratches", size: 15)
+        title.font = .systemFont(ofSize: 15, weight: .medium)
+        title.textColor = .secondaryLabelColor
+        let buttons = NSStackView(views: Self.actions.enumerated().map { index, action in
+            let key = KeymapStore.shared.key(for: action.1).map { "  \($0.display)" } ?? ""
+            let button = NSButton(title: action.0 + key, target: self, action: #selector(clicked(_:)))
+            button.bezelStyle = .rounded
+            button.tag = index
+            return button
+        })
+        buttons.spacing = 8
+        let stack = NSStackView(views: [icon, title, buttons])
+        stack.orientation = .vertical
+        stack.spacing = 12
+        stack.setCustomSpacing(18, after: title)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.centerXAnchor.constraint(equalTo: centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: centerYAnchor, constant: -20),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override var acceptsFirstResponder: Bool { true }
+
+    @objc private func clicked(_ sender: NSButton) { perform(Self.actions[sender.tag].1) }
+}
+
+/// The editor pane reaches up under the (transparent) toolbar; it paints the darker band the tabs sit on, ending
+/// where the tabs end, so the active tab — filled like the page — reads as part of the page below it.
+final class TabBackdropView: NSView {
+    weak var strip: NSView? { didSet { needsDisplay = true } }
+
+    override func layout() {
+        super.layout()
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let strip, strip.window === window, window != nil else { return }
+        let bottom = convert(strip.bounds, from: strip).minY
+        guard bottom < bounds.maxY else { return }
+        let dark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        NSColor.windowBackgroundColor.blended(withFraction: dark ? 0.38 : 0.09, of: .black)?.setFill()
+        NSRect(x: 0, y: bottom, width: bounds.width, height: bounds.maxY - bottom).fill()
     }
 }

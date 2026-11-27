@@ -12,6 +12,7 @@ protocol SidebarDelegate: AnyObject {
     /// Menu for a folder row, or for the empty area below the list when `folder` is nil.
     func sidebarFolderMenu(_ sidebar: SidebarViewController, for folder: ScratchFolder?) -> NSMenu
     func sidebar(_ sidebar: SidebarViewController, openTool id: String)
+    func sidebar(_ sidebar: SidebarViewController, addExternalFolders urls: [URL])
 }
 
 private final class Node: NSObject {
@@ -75,19 +76,31 @@ private final class Node: NSObject {
 
 /// Buckets for "Group by Date Edited", newest first: Today, Yesterday, Previous 7/30 Days, then by month.
 private enum DateBucket {
-    static func of(_ date: Date, now: Date = Date(), calendar: Calendar = .current) -> (rank: Int, key: String, title: String) {
+    typealias Bucket = (rank: Int, key: String, title: String)
+
+    /// A function that buckets dates relative to `now`; the day boundaries and month titles are worked out
+    /// once per call rather than per date (sidebars can list thousands of files).
+    static func bucketer(now: Date = Date(), calendar: Calendar = .current) -> (Date) -> Bucket {
         let today = calendar.startOfDay(for: now)
-        let day = calendar.startOfDay(for: date)
-        let days = calendar.dateComponents([.day], from: day, to: today).day ?? 0
-        if days <= 0 { return (0, "date:today", "Today") }
-        if days == 1 { return (1, "date:yesterday", "Yesterday") }
-        if days < 7 { return (2, "date:week", "Previous 7 Days") }
-        if days < 30 { return (3, "date:month", "Previous 30 Days") }
-        let parts = calendar.dateComponents([.year, .month], from: date)
-        let year = parts.year ?? 0, month = parts.month ?? 0
-        let formatter = DateFormatter()
-        formatter.setLocalizedDateFormatFromTemplate(year == calendar.component(.year, from: now) ? "MMMM" : "MMMM yyyy")
-        return (1_000_000 - (year * 12 + month), String(format: "date:%04d-%02d", year, month), formatter.string(from: date))
+        let day = { (offset: Int) in calendar.date(byAdding: .day, value: -offset, to: today) ?? today }
+        let yesterday = day(1), week = day(6), month = day(29)
+        let thisYear = calendar.component(.year, from: now)
+        var months: [Int: Bucket] = [:]
+        return { date in
+            if date >= today { return (0, "date:today", "Today") }
+            if date >= yesterday { return (1, "date:yesterday", "Yesterday") }
+            if date >= week { return (2, "date:week", "Previous 7 Days") }
+            if date >= month { return (3, "date:month", "Previous 30 Days") }
+            let parts = calendar.dateComponents([.year, .month], from: date)
+            let year = parts.year ?? 0, monthNumber = parts.month ?? 0
+            let index = year * 12 + monthNumber
+            if let cached = months[index] { return cached }
+            let formatter = DateFormatter()
+            formatter.setLocalizedDateFormatFromTemplate(year == thisYear ? "MMMM" : "MMMM yyyy")
+            let bucket = (1_000_000 - index, String(format: "date:%04d-%02d", year, monthNumber), formatter.string(from: date))
+            months[index] = bucket
+            return bucket
+        }
     }
 }
 
@@ -180,12 +193,12 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
 
     /// Scratches in display order (group order when grouped).
     var orderedScratches: [Scratch] {
-        roots.flatMap { [$0] + $0.descendants }.compactMap(\.scratch).filter(\.isInScratchFolder)
+        roots.flatMap { [$0] + $0.descendants }.compactMap(\.scratch).filter(\.isListed)
     }
 
-    /// Selected scratches that live in the scratches folder (never the shared package.json).
+    /// Selected files from the scratches folder or an external folder (never the shared package.json).
     var selectedScratches: [Scratch] {
-        outline.selectedRowIndexes.compactMap { (outline.item(atRow: $0) as? Node)?.scratch }.filter(\.isInScratchFolder)
+        outline.selectedRowIndexes.compactMap { (outline.item(atRow: $0) as? Node)?.scratch }.filter(\.isListed)
     }
 
     var selectedFolders: [ScratchFolder] {
@@ -321,10 +334,21 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
         suppressSelection = true
         outline.reloadData()
         let collapsed = Settings.shared.collapsedGroups
+        // Folders on the way to a selected scratch are opened so the selection shows.
+        var selectedFolders = Set<String>()
+        for scratch in selected {
+            var folder = scratch.folder
+            while !folder.isEmpty, selectedFolders.insert(folder).inserted {
+                let parent = ScratchFolder(id: folder).parent
+                if parent == folder { break }
+                folder = parent
+            }
+        }
         func expand(_ nodes: [Node]) {
             for node in nodes where node.isExpandable {
-                let holdsSelection = node.descendants.contains { $0.scratch.map(selected.contains) ?? false }
-                if !collapsed.contains(node.groupKey!) || holdsSelection {
+                if !Self.isCollapsed(node.groupKey!, folder: node.folder, in: collapsed)
+                    || node.folder.map({ selectedFolders.contains($0.id) })
+                    ?? node.children.contains(where: { $0.scratch.map(selected.contains) ?? false }) {
                     outline.expandItem(node)
                     expand(node.children)
                 }
@@ -341,13 +365,41 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
         if let activeTool { selectTool(activeTool) }
     }
 
+    /// Folders inside external folders start collapsed (they can be large), so for them the remembered
+    /// state is "expanded" instead of "collapsed".
+    fileprivate static func isCollapsed(_ key: String, folder: ScratchFolder?, in collapsed: Set<String>) -> Bool {
+        if let folder, folder.isExternal, !folder.isExternalRoot { return !collapsed.contains("open|" + key) }
+        return collapsed.contains(key)
+    }
+
+    fileprivate static func rememberExpansion(_ expanded: Bool, key: String, folder: ScratchFolder?) {
+        if let folder, folder.isExternal, !folder.isExternalRoot {
+            if expanded { Settings.shared.collapsedGroups.insert("open|" + key) } else { Settings.shared.collapsedGroups.remove("open|" + key) }
+        } else if expanded {
+            Settings.shared.collapsedGroups.remove(key)
+        } else {
+            Settings.shared.collapsedGroups.insert(key)
+        }
+    }
+
+    /// Scratch folders before external folders, each by name.
+    fileprivate static func folderOrder(_ a: ScratchFolder, _ b: ScratchFolder) -> Bool {
+        if a.isExternal != b.isExternal { return !a.isExternal }
+        return a.name.localizedStandardCompare(b.name) == .orderedAscending
+    }
+
     /// Folders first (by name), then that folder's scratches (grouped by `leaves`); folders nest recursively.
     private static func folderTree(_ scratches: [Scratch], folders: [ScratchFolder], in parent: String,
                                    leaves: ([Scratch], String) -> [Node]) -> [Node] {
-        let subfolders = folders.filter { $0.parent == parent }
-            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-            .map { Node(folder: $0, children: folderTree(scratches, folders: folders, in: $0.id, leaves: leaves)) }
-        return subfolders + leaves(scratches.filter { $0.folder == parent }, parent)
+        let byFolder = Dictionary(grouping: scratches, by: \.folder)
+        let byParent = Dictionary(grouping: folders, by: \.parent)
+        func build(_ parent: String) -> [Node] {
+            let subfolders = (byParent[parent] ?? []).sorted(by: folderOrder).map { Node(folder: $0, children: build($0.id)) }
+            let local = subfolders.filter { $0.folder?.isExternal != true }
+            let external = subfolders.filter { $0.folder?.isExternal == true }
+            return local + leaves(byFolder[parent] ?? [], parent) + external
+        }
+        return build(parent)
     }
 
     /// One folder level's scratches: plain, or under type/date headers. Top-level header keys stay unprefixed
@@ -363,8 +415,8 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
                 return Node(key: keyPrefix + lang.rawValue, title: lang.displayName, children: items.map(Node.init(scratch:)))
             }
         case .date:
-            let now = Date()
-            let buckets = Dictionary(grouping: scratches.map { ($0, DateBucket.of($0.modified, now: now)) }, by: \.1.key)
+            let bucket = DateBucket.bucketer()
+            let buckets = Dictionary(grouping: scratches.map { ($0, bucket($0.modified)) }, by: \.1.key)
             return buckets.values
                 .sorted { $0[0].1.rank < $1[0].1.rank }
                 .map { items in
@@ -446,7 +498,7 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
 
     @objc private func doubleClicked() {
         let row = outline.clickedRow
-        guard row >= 0, let scratch = (outline.item(atRow: row) as? Node)?.scratch, scratch.isInScratchFolder else { return }
+        guard row >= 0, let scratch = (outline.item(atRow: row) as? Node)?.scratch, scratch.isListed else { return }
         beginRename(scratch)
     }
 
@@ -615,6 +667,7 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
 
     func outlineView(_ outlineView: NSOutlineView, heightOfRowByItem item: Any) -> CGFloat {
         guard let node = item as? Node else { return 40 }
+        if node.folder?.isExternalRoot == true { return 40 }
         return node.isGroup ? 26 : node.isFolder || node.isSpecial ? 32 : 40
     }
 
@@ -682,13 +735,13 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
     }
 
     func outlineViewItemDidCollapse(_ notification: Notification) {
-        guard let key = (notification.userInfo?["NSObject"] as? Node)?.groupKey else { return }
-        Settings.shared.collapsedGroups.insert(key)
+        guard let node = notification.userInfo?["NSObject"] as? Node, let key = node.groupKey else { return }
+        Self.rememberExpansion(false, key: key, folder: node.folder)
     }
 
     func outlineViewItemDidExpand(_ notification: Notification) {
-        guard let key = (notification.userInfo?["NSObject"] as? Node)?.groupKey else { return }
-        Settings.shared.collapsedGroups.remove(key)
+        guard let node = notification.userInfo?["NSObject"] as? Node, let key = node.groupKey else { return }
+        Self.rememberExpansion(true, key: key, folder: node.folder)
     }
 
     // MARK: Drag & drop
@@ -714,12 +767,13 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
         guard let target = dropTarget(for: item) else { return [] }
         if info.draggingSource as? NSOutlineView === outline {
             let (scratches, folders) = draggedItems(info)
-            let moves = scratches.contains { $0.folder != target.folder }
-                || folders.contains { $0.parent != target.folder }
-            let intoItself = folders.contains { $0.id == target.folder || $0.contains(target.folder) }
-            guard moves, !intoItself else { return [] }
+            guard Self.canMove(scratches, folders, to: target.folder) else { return [] }
             outlineView.setDropItem(target.node, dropChildIndex: NSOutlineViewDropOnItemIndex)
             return .move
+        }
+        if !externalFolders(info).isEmpty {
+            outlineView.setDropItem(nil, dropChildIndex: NSOutlineViewDropOnItemIndex)
+            return .link
         }
         guard !externalFiles(info).isEmpty else { return [] }
         outlineView.setDropItem(target.node, dropChildIndex: NSOutlineViewDropOnItemIndex)
@@ -734,10 +788,25 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
             delegate?.sidebar(self, move: scratches, folders: folders, to: target.folder)
             return true
         }
+        let folders = externalFolders(info)
+        if !folders.isEmpty {
+            delegate?.sidebar(self, addExternalFolders: folders)
+            return true
+        }
         let urls = externalFiles(info)
         guard !urls.isEmpty else { return false }
         delegate?.sidebar(self, importFiles: urls, into: target.folder)
         return true
+    }
+
+    /// Moves stay inside one tree: the scratches folder, or a single external folder (whose root can't move).
+    fileprivate static func canMove(_ scratches: [Scratch], _ folders: [ScratchFolder], to target: String) -> Bool {
+        let root = storageRoot(ofFolder: target)
+        let moves = scratches.contains { $0.folder != target } || folders.contains { $0.parent != target }
+        let intoItself = folders.contains { $0.id == target || $0.contains(target) }
+        let crossesTrees = scratches.contains { $0.storageRoot != root }
+            || folders.contains { $0.isExternalRoot || $0.storageRoot != root }
+        return moves && !intoItself && !crossesTrees
     }
 
     private func draggedURLs(_ info: NSDraggingInfo) -> [URL] {
@@ -748,21 +817,34 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
     fileprivate func draggedItems(_ info: NSDraggingInfo) -> ([Scratch], [ScratchFolder]) {
         var scratches: [Scratch] = [], folders: [ScratchFolder] = []
         for url in draggedURLs(info) {
-            guard let id = relativePath(url), !id.isEmpty else { continue }
+            guard let id = folderId(for: url), !id.isEmpty else { continue }
             var isDir: ObjCBool = false
             guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) else { continue }
-            if isDir.boolValue { folders.append(ScratchFolder(id: id)) } else { scratches.append(Scratch(url: url)) }
+            if isDir.boolValue && !RichTextIO.isPackage(url) {
+                folders.append(ScratchFolder(id: id))
+            } else {
+                scratches.append(Scratch(url: url))
+            }
         }
         let nested = { (id: String) in folders.contains { $0.contains(id) } }
         return (scratches.filter { !nested($0.id) }, folders.filter { !nested($0.id) })
     }
 
-    /// Regular files from outside the scratch folder (Finder, other apps).
+    /// Regular files from outside the listed folders (Finder, other apps).
     fileprivate func externalFiles(_ info: NSDraggingInfo) -> [URL] {
         draggedURLs(info).filter { url in
             var isDir: ObjCBool = false
             return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) && !isDir.boolValue
-                && relativePath(url) == nil
+                && folderId(for: url) == nil
+        }
+    }
+
+    /// Folders dragged in from Finder, which are added as external folders.
+    fileprivate func externalFolders(_ info: NSDraggingInfo) -> [URL] {
+        draggedURLs(info).filter { url in
+            var isDir: ObjCBool = false
+            return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) && isDir.boolValue
+                && !RichTextIO.isPackage(url) && folderId(for: url) == nil
         }
     }
 
@@ -961,7 +1043,7 @@ private final class ScratchCell: NSTableCellView {
         renameWidth = title.widthAnchor.constraint(greaterThanOrEqualToConstant: max(120, bounds.width - 44))
         renameWidth?.isActive = true
         window.makeFirstResponder(title)
-        let stem = isFolder ? title.stringValue : (title.stringValue as NSString).deletingPathExtension
+        let stem = isFolder ? title.stringValue : Language.stem(of: title.stringValue)
         title.currentEditor()?.selectedRange = NSRange(location: 0, length: (stem as NSString).length)
         return true
     }
@@ -1019,10 +1101,22 @@ private final class ScratchCell: NSTableCellView {
         isFolder = true
         original = folder.name
         title.stringValue = folder.name
-        icon.configure(symbol: "folder.fill", tint: .systemBlue)
-        subtitle.stringValue = count == 1 ? "1 scratch" : "\(count) scratches"
-        subtitle.isHidden = true
-        toolTip = "\(folder.url.path)\n\(subtitle.stringValue)"
+        let files = count == 1 ? "1 file" : "\(count) files"
+        if folder.isExternalRoot {
+            icon.configure(symbol: "externaldrive.fill", tint: .systemOrange)
+            subtitle.stringValue = "External · \(ExternalFolders.displayPath((folder.id as NSString).deletingLastPathComponent))"
+            subtitle.isHidden = false
+            var tip = "External folder: \(folder.url.path)\n\(files). Edits save to the original files.\nRight-click to remove it from the sidebar."
+            if ScratchStore.truncatedExternalRoots.contains(folder.id) {
+                tip += "\nOnly the first \(ScratchStore.maxExternalFiles) files are listed."
+            }
+            toolTip = tip
+        } else {
+            icon.configure(symbol: "folder.fill", tint: folder.isExternal ? .systemOrange : .systemBlue)
+            subtitle.stringValue = count == 1 ? "1 scratch" : "\(count) scratches"
+            subtitle.isHidden = true
+            toolTip = "\(folder.url.path)\n\(folder.isExternal ? files : subtitle.stringValue)"
+        }
     }
 
     func configure(_ scratch: Scratch, showLanguage: Bool, showFolder: Bool = false) {
@@ -1108,15 +1202,19 @@ private final class FolderPaneController: NSObject, NSOutlineViewDataSource, NSO
         scroll.documentView = outline
         scroll.hasVerticalScroller = true
         scroll.drawsBackground = false
-        scroll.widthAnchor.constraint(greaterThanOrEqualToConstant: 110).isActive = true
+        let minWidth = scroll.widthAnchor.constraint(greaterThanOrEqualToConstant: 110)
+        // Yields while the folders column is hidden (zero width).
+        minWidth.priority = .defaultHigh
+        minWidth.isActive = true
     }
 
     func reload(scratches: [Scratch], folders: [ScratchFolder], filter: FolderFilter) {
-        total = scratches.count
+        total = scratches.filter(\.isInScratchFolder).count
         counts = Dictionary(grouping: scratches, by: \.folder).mapValues(\.count)
+        let byParent = Dictionary(grouping: folders, by: \.parent)
         func tree(_ parent: String) -> [PaneNode] {
-            folders.filter { $0.parent == parent }
-                .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+            (byParent[parent] ?? [])
+                .sorted(by: SidebarViewController.folderOrder)
                 .map { PaneNode(filter: .folder($0.id), folder: $0, children: tree($0.id)) }
         }
         roots = [PaneNode(filter: .all), PaneNode(filter: .unfiled)] + tree("") + [PaneNode(filter: .tools), PaneNode(filter: .packages)]
@@ -1126,7 +1224,7 @@ private final class FolderPaneController: NSObject, NSOutlineViewDataSource, NSO
         func expand(_ nodes: [PaneNode]) {
             for node in nodes where !node.children.isEmpty {
                 let holdsFilter = node.descendants.contains { $0.filter == filter }
-                if !collapsed.contains(key(node)) || holdsFilter {
+                if !SidebarViewController.isCollapsed(key(node), folder: node.folder, in: collapsed) || holdsFilter {
                     outline.expandItem(node)
                     expand(node.children)
                 }
@@ -1212,7 +1310,9 @@ private final class FolderPaneController: NSObject, NSOutlineViewDataSource, NSO
         !((item as? PaneNode)?.children.isEmpty ?? true)
     }
 
-    func outlineView(_ outlineView: NSOutlineView, heightOfRowByItem item: Any) -> CGFloat { 30 }
+    func outlineView(_ outlineView: NSOutlineView, heightOfRowByItem item: Any) -> CGFloat {
+        (item as? PaneNode)?.folder?.isExternalRoot == true ? 40 : 30
+    }
 
     func outlineView(_ outlineView: NSOutlineView, rowViewForItem item: Any) -> NSTableRowView? {
         let row = HoverRowView()
@@ -1248,12 +1348,12 @@ private final class FolderPaneController: NSObject, NSOutlineViewDataSource, NSO
 
     func outlineViewItemDidCollapse(_ notification: Notification) {
         guard let node = notification.userInfo?["NSObject"] as? PaneNode else { return }
-        Settings.shared.collapsedGroups.insert(key(node))
+        SidebarViewController.rememberExpansion(false, key: key(node), folder: node.folder)
     }
 
     func outlineViewItemDidExpand(_ notification: Notification) {
         guard let node = notification.userInfo?["NSObject"] as? PaneNode else { return }
-        Settings.shared.collapsedGroups.remove(key(node))
+        SidebarViewController.rememberExpansion(true, key: key(node), folder: node.folder)
     }
 
     // MARK: Drag & drop
@@ -1264,13 +1364,15 @@ private final class FolderPaneController: NSObject, NSOutlineViewDataSource, NSO
 
     func outlineView(_ outlineView: NSOutlineView, validateDrop info: NSDraggingInfo, proposedItem item: Any?,
                      proposedChildIndex index: Int) -> NSDragOperation {
+        if source(info) == nil, !sidebar.externalFolders(info).isEmpty {
+            outlineView.setDropItem(nil, dropChildIndex: NSOutlineViewDropOnItemIndex)
+            return .link
+        }
         guard let node = item as? PaneNode, let target = node.filter.folderId else { return [] }
         let source = info.draggingSource as? NSOutlineView
         if source === outline || source === sidebar.outline {
             let (scratches, folders) = sidebar.draggedItems(info)
-            let moves = scratches.contains { $0.folder != target } || folders.contains { $0.parent != target }
-            let intoItself = folders.contains { $0.id == target || $0.contains(target) }
-            guard moves, !intoItself else { return [] }
+            guard SidebarViewController.canMove(scratches, folders, to: target) else { return [] }
             outlineView.setDropItem(node, dropChildIndex: NSOutlineViewDropOnItemIndex)
             return .move
         }
@@ -1279,7 +1381,16 @@ private final class FolderPaneController: NSObject, NSOutlineViewDataSource, NSO
         return .copy
     }
 
+    private func source(_ info: NSDraggingInfo) -> NSOutlineView? {
+        let source = info.draggingSource as? NSOutlineView
+        return source === outline || source === sidebar.outline ? source : nil
+    }
+
     func outlineView(_ outlineView: NSOutlineView, acceptDrop info: NSDraggingInfo, item: Any?, childIndex index: Int) -> Bool {
+        if source(info) == nil, case let folders = sidebar.externalFolders(info), !folders.isEmpty {
+            sidebar.delegate?.sidebar(sidebar, addExternalFolders: folders)
+            return true
+        }
         guard let target = (item as? PaneNode)?.filter.folderId, let delegate = sidebar.delegate else { return false }
         let source = info.draggingSource as? NSOutlineView
         if source === outline || source === sidebar.outline {

@@ -17,8 +17,11 @@ BIN="$(swift build -c "$CONFIG" --show-bin-path)/ScratchPad"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/web"
 cp "$BIN" "$APP/Contents/MacOS/ScratchPad"
-cp "$ROOT/web/dist/index.html" "$ROOT/web/dist/editor.bundle.js" "$APP/Contents/Resources/web/"
+cp "$ROOT"/web/dist/*.{html,js,css} "$APP/Contents/Resources/web/"
 cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
+mkdir -p "$APP/Contents/Resources/bin"
+cp "$ROOT/Resources/bin/scratchpad" "$APP/Contents/Resources/bin/scratchpad"
+chmod +x "$APP/Contents/Resources/bin/scratchpad"
 if [ -f "$ROOT/Resources/AppIcon.icns" ]; then
   cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 fi

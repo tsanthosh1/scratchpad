@@ -10,6 +10,9 @@ extension Language {
         case .xml: return .systemOrange
         case .html: return .systemRed
         case .markdown: return .systemBlue
+        case .richtext: return NSColor(red: 0.85, green: 0.3, blue: 0.55, alpha: 1)
+        case .csv: return NSColor(red: 0.13, green: 0.6, blue: 0.35, alpha: 1)
+        case .tsv: return NSColor(red: 0.1, green: 0.55, blue: 0.55, alpha: 1)
         case .http: return .systemGreen
         case .diff: return .systemOrange
         case .javascript: return NSColor(red: 0.85, green: 0.72, blue: 0.1, alpha: 1)
@@ -20,6 +23,7 @@ extension Language {
         case .css: return .systemPurple
         case .sql: return .systemTeal
         case .yaml: return .systemPink
+        case .openapi: return NSColor(red: 0.42, green: 0.66, blue: 0.13, alpha: 1)
         case .toml: return .systemBrown
         case .properties: return .systemIndigo
         case .kotlin: return NSColor(red: 0.5, green: 0.36, blue: 0.95, alpha: 1)

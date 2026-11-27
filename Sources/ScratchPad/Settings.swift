@@ -63,7 +63,8 @@ enum FolderFilter: Equatable {
     func includes(_ scratch: Scratch) -> Bool {
         if self == .packages { return scratch.isSharedManifest }
         if self == .tools { return false }
-        return folderId.map { scratch.folder == $0 } ?? true
+        // "All Scratches" means the scratches folder; external folders are browsed through their own rows.
+        return folderId.map { scratch.folder == $0 } ?? scratch.isInScratchFolder
     }
 }
 
@@ -82,6 +83,17 @@ enum SidebarGrouping: String, CaseIterable {
         switch self {
         case .none, .type: return "square.stack.3d.up"
         case .date: return "calendar"
+        }
+    }
+}
+
+enum ConsolePosition: String, CaseIterable {
+    case bottom, right
+
+    var title: String {
+        switch self {
+        case .bottom: return "Bottom"
+        case .right: return "Right"
         }
     }
 }
@@ -172,11 +184,30 @@ final class Settings {
         get { PreviewMode(rawValue: defaults.string(forKey: "previewMode") ?? "") ?? .split }
         set { defaults.set(newValue.rawValue, forKey: "previewMode") }
     }
+    /// How OpenAPI specs are previewed.
+    var specViewer: SpecViewer {
+        get { SpecViewer(rawValue: defaults.string(forKey: "specViewer") ?? "") ?? .swagger }
+        set { defaults.set(newValue.rawValue, forKey: "specViewer") }
+    }
+    /// Docking position for console (bottom vs right).
+    var consolePosition: ConsolePosition {
+        get {
+            if let raw = defaults.string(forKey: "consolePosition"), let pos = ConsolePosition(rawValue: raw) { return pos }
+            return .bottom
+        }
+        set { defaults.set(newValue.rawValue, forKey: "consolePosition"); changed() }
+    }
 
     /// Scratch ids, most recently opened first.
     var recentScratches: [String] {
         get { defaults.stringArray(forKey: "recentScratches") ?? [] }
         set { defaults.set(Array(newValue.prefix(50)), forKey: "recentScratches") }
+    }
+
+    /// Ids of the files open as tabs, in tab order.
+    var openTabs: [String] {
+        get { defaults.stringArray(forKey: "openTabs") ?? [] }
+        set { defaults.set(newValue, forKey: "openTabs") }
     }
     var lastScratch: String? {
         get { defaults.string(forKey: "lastScratch") }
@@ -201,6 +232,16 @@ final class Settings {
     }
 
     /// The dev tool page open at quit, reopened at launch.
+    /// Folders shown in the sidebar from elsewhere on disk (see `ExternalFolders`).
+    var externalFolders: [String] {
+        get { defaults.stringArray(forKey: "externalFolders") ?? [] }
+        set { defaults.set(newValue, forKey: "externalFolders") }
+    }
+    /// Files opened from outside the scratch folder (Dock, Finder, ⌘O), most recent first.
+    var openedFiles: [String] {
+        get { defaults.stringArray(forKey: "openedFiles") ?? [] }
+        set { defaults.set(Array(newValue.prefix(30)), forKey: "openedFiles") }
+    }
     var lastTool: String? {
         get { defaults.string(forKey: "lastTool") }
         set { defaults.set(newValue, forKey: "lastTool") }

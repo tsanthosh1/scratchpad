@@ -1,0 +1,60 @@
+#!/bin/bash
+# Opens files and folders in ScratchPad. Install it from ScratchPad ▸ Install Command Line Tool…
+set -euo pipefail
+
+BUNDLE_ID="dev.tsanthosh.scratchpad"
+
+usage() {
+  cat <<'EOF'
+Usage: scratchpad [file | folder | -] ...
+
+  scratchpad notes.md          Open a file. Edits save back to the file.
+  scratchpad ~/work/project    Add a folder to the sidebar as an external folder
+                               (its files are listed and searched with Find in Files).
+  scratchpad .                 Add the current folder.
+  command | scratchpad -       Open piped text as a new scratch (the file type is detected).
+  scratchpad                   Bring ScratchPad to the front.
+
+External folders can be removed from the sidebar by right-clicking them; the folder itself is left untouched.
+EOF
+}
+
+absolute() {
+  if [ -d "$1" ]; then
+    (cd "$1" && pwd -P)
+  else
+    local dir
+    dir="$(cd "$(dirname "$1")" && pwd -P)"
+    echo "$dir/$(basename "$1")"
+  fi
+}
+
+paths=()
+piped=""
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help) usage; exit 0 ;;
+    -)
+      piped="$(mktemp "${TMPDIR:-/tmp}/scratchpad-stdin.XXXXXX")"
+      cat > "$piped"
+      ;;
+    -*) echo "scratchpad: unknown option $arg" >&2; usage >&2; exit 2 ;;
+    *)
+      if [ ! -e "$arg" ]; then
+        echo "scratchpad: no such file or folder: $arg" >&2
+        exit 1
+      fi
+      paths+=("$(absolute "$arg")")
+      ;;
+  esac
+done
+
+if [ ${#paths[@]} -gt 0 ]; then
+  open -b "$BUNDLE_ID" "${paths[@]}"
+fi
+if [ -n "$piped" ]; then
+  open -b "$BUNDLE_ID" "scratchpad://import?path=$piped"
+fi
+if [ ${#paths[@]} -eq 0 ] && [ -z "$piped" ]; then
+  open -b "$BUNDLE_ID"
+fi

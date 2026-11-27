@@ -80,6 +80,11 @@ struct KeyCombo: Equatable {
             mask.remove(.shift)
             return (shifted, mask)
         }
+        // ⇧+letter must be written as the capital: "m" with ⇧⌘ fires on ⌘M instead, at least with Dvorak layouts.
+        if shift, key.count == 1, key.first?.isLetter == true {
+            mask.remove(.shift)
+            return (key.uppercased(), mask)
+        }
         if let code = Self.keyEquivalents[key], let scalar = UnicodeScalar(code) {
             return (String(Character(scalar)), mask)
         }
@@ -102,6 +107,20 @@ struct KeyCombo: Equatable {
         122: "F1", 120: "F2", 99: "F3", 118: "F4", 96: "F5", 97: "F6", 98: "F7", 100: "F8",
         101: "F9", 109: "F10", 103: "F11", 111: "F12",
     ]
+
+    private static let digitKeyCodes: [UInt16: String] = [
+        18: "1", 19: "2", 20: "3", 21: "4", 23: "5", 22: "6", 26: "7", 28: "8", 25: "9", 29: "0",
+    ]
+
+    /// The event read as the digit printed on its number-row key: Programmer Dvorak and AZERTY type "&" there,
+    /// so ⌘1 arrives as ⌘& and matches no menu item.
+    init?(digitKeyOf event: NSEvent) {
+        guard let digit = Self.digitKeyCodes[event.keyCode], var combo = KeyCombo(event: event), combo.key != digit else {
+            return nil
+        }
+        combo.key = digit
+        self = combo
+    }
 
     /// Builds a combo from a key-down event (used by the shortcut recorder).
     init?(event: NSEvent) {
@@ -134,7 +153,12 @@ struct ActionDef {
     let title: String
     let category: String
     let scope: ActionScope
+    /// The primary shortcut, shown in menus.
     let defaultKey: String?
+    /// More shortcuts that run the same action.
+    var alternateKeys: [String] = []
+
+    var defaultKeys: [String] { (defaultKey.map { [$0] } ?? []) + alternateKeys }
 }
 
 /// Every bindable action. Defaults follow IntelliJ's macOS keymap where it makes sense.
@@ -151,9 +175,18 @@ enum Actions {
         .init(id: "revealInSidebar", title: "Reveal in Scratch List", category: "Scratch", scope: .app, defaultKey: "Cmd-1"),
         .init(id: "compareWithClipboard", title: "Compare with Clipboard", category: "Scratch", scope: .app, defaultKey: nil),
         .init(id: "nextScratch", title: "Next Scratch", category: "Scratch", scope: .app, defaultKey: "Shift-Cmd-]"),
-        .init(id: "navigateBack", title: "Back", category: "Scratch", scope: .app, defaultKey: "Shift-Cmd-ArrowLeft"),
-        .init(id: "navigateForward", title: "Forward", category: "Scratch", scope: .app, defaultKey: "Shift-Cmd-ArrowRight"),
+        .init(id: "navigateBack", title: "Back", category: "Scratch", scope: .app, defaultKey: "Alt-Cmd-ArrowLeft"),
+        .init(id: "navigateForward", title: "Forward", category: "Scratch", scope: .app, defaultKey: "Alt-Cmd-ArrowRight"),
+        .init(id: "save", title: "Save", category: "Scratch", scope: .app, defaultKey: "Cmd-s"),
+        .init(id: "closeTab", title: "Close Tab", category: "Tabs", scope: .app, defaultKey: "Cmd-w"),
+        .init(id: "closeOtherTabs", title: "Close Other Tabs", category: "Tabs", scope: .app, defaultKey: "Alt-Cmd-w"),
+        .init(id: "closeAllTabs", title: "Close All Tabs", category: "Tabs", scope: .app, defaultKey: nil),
+        .init(id: "nextTab", title: "Next Tab", category: "Tabs", scope: .app, defaultKey: "Ctrl-Tab"),
+        .init(id: "previousTab", title: "Previous Tab", category: "Tabs", scope: .app, defaultKey: "Ctrl-Shift-Tab"),
         .init(id: "recentScratches", title: "Recent Scratches…", category: "Scratch", scope: .app, defaultKey: "Cmd-e"),
+        .init(id: "gotoScratch", title: "Go to Scratch by Name…", category: "Scratch", scope: .app, defaultKey: "Shift-Cmd-o"),
+        .init(id: "gotoSymbol", title: "Go to Symbol…", category: "Code", scope: .app, defaultKey: "Cmd-["),
+        .init(id: "openFile", title: "Open File…", category: "Scratch", scope: .app, defaultKey: "Cmd-o"),
         .init(id: "previousScratch", title: "Previous Scratch", category: "Scratch", scope: .app, defaultKey: "Shift-Cmd-["),
         .init(id: "commandPalette", title: "Find Action / Dev Tools…", category: "Scratch", scope: .app, defaultKey: "Shift-Cmd-a"),
 
@@ -204,7 +237,34 @@ enum Actions {
         .init(id: "findNext", title: "Find Next", category: "Find", scope: .editor, defaultKey: "Cmd-g"),
         .init(id: "findPrevious", title: "Find Previous", category: "Find", scope: .editor, defaultKey: "Shift-Cmd-g"),
         .init(id: "gotoLine", title: "Go to Line…", category: "Find", scope: .editor, defaultKey: "Ctrl-l"),
-        .init(id: "findInScratches", title: "Find in Scratches…", category: "Find", scope: .app, defaultKey: "Shift-Cmd-f"),
+        .init(id: "findInScratches", title: "Find in Files…", category: "Find", scope: .app, defaultKey: "Shift-Cmd-f"),
+        .init(id: "addExternalFolder", title: "Add Folder to Sidebar…", category: "Scratch", scope: .app, defaultKey: "Alt-Cmd-o"),
+        .init(id: "installCLI", title: "Install Command Line Tool…", category: "Scratch", scope: .app, defaultKey: nil),
+        .init(id: "copyRichText", title: "Copy Preview as Rich Text", category: "View", scope: .app, defaultKey: nil),
+        .init(id: "exportPreview", title: "Export Preview…", category: "View", scope: .app, defaultKey: nil),
+        .init(id: "exportPreviewPDF", title: "Export Preview as PDF…", category: "View", scope: .app, defaultKey: nil),
+        .init(id: "exportPreviewHTML", title: "Export Preview as HTML…", category: "View", scope: .app, defaultKey: nil),
+        .init(id: "exportPreviewMHTML", title: "Export Preview as MHTML…", category: "View", scope: .app, defaultKey: nil),
+        .init(id: "specViewerSwagger", title: "Show OpenAPI in Swagger UI", category: "View", scope: .app, defaultKey: nil),
+        .init(id: "specViewerScalar", title: "Show OpenAPI in Scalar", category: "View", scope: .app, defaultKey: nil),
+        .init(id: "specViewerKong", title: "Show OpenAPI in Kong", category: "View", scope: .app, defaultKey: nil),
+
+        // Rich text scratches
+        .init(id: "formatBold", title: "Bold", category: "Format", scope: .app, defaultKey: "Cmd-b"),
+        .init(id: "formatItalic", title: "Italic", category: "Format", scope: .app, defaultKey: "Cmd-i"),
+        .init(id: "formatUnderline", title: "Underline", category: "Format", scope: .app, defaultKey: "Cmd-u"),
+        .init(id: "formatStrikethrough", title: "Strikethrough", category: "Format", scope: .app, defaultKey: nil),
+        .init(id: "formatBigger", title: "Bigger", category: "Format", scope: .app, defaultKey: "Alt-Cmd-="),
+        .init(id: "formatSmaller", title: "Smaller", category: "Format", scope: .app, defaultKey: "Alt-Cmd--"),
+        .init(id: "formatFonts", title: "Show Fonts", category: "Format", scope: .app, defaultKey: "Cmd-t"),
+        .init(id: "formatAlignLeft", title: "Align Left", category: "Format", scope: .app, defaultKey: nil),
+        .init(id: "formatAlignCenter", title: "Centre", category: "Format", scope: .app, defaultKey: nil),
+        .init(id: "formatAlignRight", title: "Align Right", category: "Format", scope: .app, defaultKey: nil),
+        .init(id: "formatJustify", title: "Justify", category: "Format", scope: .app, defaultKey: nil),
+        .init(id: "formatBulletList", title: "Bulleted List", category: "Format", scope: .app, defaultKey: nil),
+        .init(id: "formatNumberedList", title: "Numbered List", category: "Format", scope: .app, defaultKey: nil),
+        .init(id: "formatInsertImage", title: "Insert Image…", category: "Format", scope: .app, defaultKey: nil),
+        .init(id: "formatClear", title: "Clear Formatting", category: "Format", scope: .app, defaultKey: nil),
 
         // Folding
         .init(id: "fold", title: "Collapse", category: "Folding", scope: .editor, defaultKey: "Shift-Cmd--"),
@@ -213,8 +273,11 @@ enum Actions {
         .init(id: "unfoldAll", title: "Expand All", category: "Folding", scope: .editor, defaultKey: "Alt-Shift-Cmd-="),
 
         // View
-        .init(id: "toggleSidebar", title: "Toggle Scratch List", category: "View", scope: .app, defaultKey: "Shift-Cmd-m"),
+        .init(id: "toggleSidebar", title: "Toggle Scratch List", category: "View", scope: .app, defaultKey: "Ctrl-Cmd-s"),
+        .init(id: "editorOnly", title: "Editor Only (Hide Scratch List and Console)", category: "View", scope: .app,
+              defaultKey: "Ctrl-Shift-m"),
         .init(id: "toggleConsole", title: "Toggle Run Console", category: "View", scope: .app, defaultKey: "Cmd-4"),
+        .init(id: "toggleConsolePosition", title: "Move Console to Right / Bottom", category: "View", scope: .app, defaultKey: nil),
         .init(id: "clearConsole", title: "Clear Console", category: "View", scope: .app, defaultKey: "Cmd-k"),
         .init(id: "toggleWrap", title: "Toggle Soft Wrap", category: "View", scope: .app, defaultKey: nil),
         .init(id: "togglePreview", title: "Toggle Preview / Diff View", category: "View", scope: .app, defaultKey: "Shift-Cmd-v"),
@@ -235,40 +298,62 @@ extension Notification.Name {
     static let settingsChanged = Notification.Name("ScratchPad.settingsChanged")
 }
 
-/// Default bindings plus user overrides persisted in `keymap.json` (only overrides are written,
-/// an empty string means "unbound").
+/// Default bindings plus user overrides persisted in `keymap.json`. Only overrides are written: a string for one
+/// shortcut, a list for several, and an empty string (or list) for "unbound". The first shortcut is the primary one.
 final class KeymapStore {
     static let shared = KeymapStore()
 
-    private(set) var overrides: [String: String] = [:]
+    private(set) var overrides: [String: [String]] = [:]
     let fileURL = AppPaths.support.appendingPathComponent("keymap.json")
 
     private init() { reload() }
 
     func reload() {
         guard let data = try? Data(contentsOf: fileURL),
-              let dict = try? JSONSerialization.jsonObject(with: data) as? [String: String] else {
+              let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             overrides = [:]
             return
         }
-        overrides = dict.filter { Actions.byId[$0.key] != nil }
+        overrides = [:]
+        for (id, value) in dict where Actions.byId[id] != nil {
+            if let one = value as? String { overrides[id] = one.isEmpty ? [] : [one] }
+            if let many = value as? [String] { overrides[id] = many.filter { !$0.isEmpty } }
+        }
     }
 
-    func key(for id: String) -> KeyCombo? {
-        let raw = overrides[id] ?? Actions.byId[id]?.defaultKey ?? ""
-        return KeyCombo(raw)
+    /// Every shortcut of an action, primary first.
+    func keys(for id: String) -> [KeyCombo] {
+        (overrides[id] ?? Actions.byId[id]?.defaultKeys ?? []).compactMap(KeyCombo.init)
     }
+
+    /// The primary shortcut (menus, tooltips).
+    func key(for id: String) -> KeyCombo? { keys(for: id).first }
 
     func isCustomized(_ id: String) -> Bool { overrides[id] != nil }
 
-    func set(_ combo: KeyCombo?, for id: String) {
-        let value = combo?.string ?? ""
-        if value == (Actions.byId[id]?.defaultKey ?? "") {
+    /// Replaces all of an action's shortcuts.
+    func setKeys(_ combos: [KeyCombo], for id: String) {
+        var unique: [String] = []
+        for combo in combos where !unique.contains(combo.string) { unique.append(combo.string) }
+        if unique == (Actions.byId[id]?.defaultKeys ?? []) {
             overrides.removeValue(forKey: id)
         } else {
-            overrides[id] = value
+            overrides[id] = unique
         }
         save()
+    }
+
+    /// Replaces all of an action's shortcuts with one (nil: unbound).
+    func set(_ combo: KeyCombo?, for id: String) {
+        setKeys(combo.map { [$0] } ?? [], for: id)
+    }
+
+    func add(_ combo: KeyCombo, for id: String) {
+        setKeys(keys(for: id) + [combo], for: id)
+    }
+
+    func remove(_ combo: KeyCombo, from id: String) {
+        setKeys(keys(for: id).filter { $0 != combo }, for: id)
     }
 
     func reset(_ id: String) {
@@ -286,27 +371,33 @@ final class KeymapStore {
     func conflicts(for combo: KeyCombo, excluding id: String) -> [ActionDef] {
         guard let scope = Actions.byId[id]?.scope else { return [] }
         return Actions.all.filter { other in
-            guard other.id != id, key(for: other.id) == combo else { return false }
+            guard other.id != id, keys(for: other.id).contains(combo) else { return false }
             return other.scope == scope || other.scope == .app || scope == .app
         }
     }
 
     func action(for combo: KeyCombo, scope: ActionScope) -> ActionDef? {
-        Actions.all.first { $0.scope == scope && key(for: $0.id) == combo }
+        Actions.all.first { $0.scope == scope && keys(for: $0.id).contains(combo) }
     }
 
-    /// Bindings for editor-scoped actions, in the `{ command: key }` shape the web editor expects.
-    func bindings(for scope: ActionScope) -> [String: String] {
-        var result: [String: String] = [:]
+    /// The app action a key press triggers through one of its extra (non-menu) shortcuts.
+    func alternateAction(for combo: KeyCombo) -> ActionDef? {
+        Actions.all.first { $0.scope == .app && keys(for: $0.id).dropFirst().contains(combo) }
+    }
+
+    /// Bindings in the `{ command: [keys] }` shape the web editor expects.
+    func bindings(for scope: ActionScope) -> [String: [String]] {
+        var result: [String: [String]] = [:]
         for action in Actions.all where action.scope == scope {
-            result[action.id] = key(for: action.id)?.string ?? ""
+            result[action.id] = keys(for: action.id).map(\.string)
         }
         return result
     }
 
     private func save() {
         do {
-            let data = try JSONSerialization.data(withJSONObject: overrides, options: [.prettyPrinted, .sortedKeys])
+            let stored: [String: Any] = overrides.mapValues { $0.count == 1 ? $0[0] as Any : $0 as Any }
+            let data = try JSONSerialization.data(withJSONObject: stored, options: [.prettyPrinted, .sortedKeys])
             try data.write(to: fileURL, options: .atomic)
         } catch {
             NSLog("ScratchPad: failed to save keymap: \(error)")

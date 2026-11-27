@@ -3,7 +3,8 @@ import Foundation
 /// Converts between curl command lines and `HTTPRequest`s.
 enum Curl {
     static func looksLikeCurl(_ text: String) -> Bool {
-        text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let start = text.firstIndex(where: { !$0.isWhitespace }) else { return false }
+        return text[start...].prefix(16)
             .range(of: #"^curl(\.exe)?\s"#, options: [.regularExpression, .caseInsensitive]) != nil
     }
 

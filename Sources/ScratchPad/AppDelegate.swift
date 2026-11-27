@@ -4,6 +4,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var main: MainWindowController!
     private var settingsWindow: SettingsWindowController?
     private var actionItems: [String: [NSMenuItem]] = [:]
+    /// Files handed over (dock drop, Finder "Open With") before the window exists.
+    private var pendingFiles: [URL] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.mainMenu = buildMainMenu()
@@ -11,11 +13,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NotificationCenter.default.addObserver(forName: .keymapChanged, object: nil, queue: .main) { [weak self] _ in
             self?.applyKeyEquivalents()
         }
+        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let main = self?.main, let combo = KeyCombo(event: event) else { return event }
+            let keys = KeymapStore.shared
+            // Extra shortcuts of app actions: a menu item holds only one key equivalent.
+            if let action = keys.alternateAction(for: combo), main.performShortcut(action.id) { return nil }
+            if keys.action(for: combo, scope: .app) == nil, let digit = KeyCombo(digitKeyOf: event),
+               let action = keys.action(for: digit, scope: .app), main.performShortcut(action.id) {
+                return nil
+            }
+            return event
+        }
 
         main = MainWindowController()
         main.window?.isReleasedWhenClosed = false
         main.showWindow(nil)
         NSApp.activate(ignoringOtherApps: true)
+        if !pendingFiles.isEmpty {
+            main.openFiles(pendingFiles)
+            pendingFiles = []
+        }
 
         // Warm the Node lookup so the first run doesn't wait on a login shell.
         DispatchQueue.global(qos: .utility).async { _ = Toolchains.resolveNode() }
@@ -33,6 +50,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool { true }
 
+    /// Files dropped on the Dock icon or opened with ScratchPad from Finder.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        guard let main else {
+            pendingFiles += urls
+            return
+        }
+        main.openFiles(urls)
+    }
+
     @objc func showSettings(_ sender: Any?) {
         if settingsWindow == nil { settingsWindow = SettingsWindowController() }
         settingsWindow?.showWindow(nil)
@@ -41,6 +67,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func showMainWindow(_ sender: Any?) {
         main.showWindow(nil)
+    }
+
+    /// Reached only when the main window isn't key: ⌘W (Close Tab) then closes the window in front, such as Settings.
+    @objc func performAction(_ sender: Any?) {
+        guard (sender as? NSMenuItem)?.representedObject as? String == "closeTab" else { return }
+        NSApp.keyWindow?.performClose(nil)
+    }
+
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        guard menuItem.action == #selector(performAction(_:)) else { return true }
+        return menuItem.representedObject as? String == "closeTab" && NSApp.keyWindow != nil
     }
 
     // MARK: Menu
@@ -78,6 +115,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             item("About \(appName)", #selector(NSApplication.orderFrontStandardAboutPanel(_:)), ""),
             .separator(),
             settings,
+            action("installCLI"),
             .separator(),
             item("Hide \(appName)", #selector(NSApplication.hide(_:)), "h"),
             item("Hide Others", #selector(NSApplication.hideOtherApplications(_:)), "h", [.command, .option]),
@@ -87,14 +125,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ]))
 
         mainMenu.addItem(submenu("Scratch", [
-            action("newScratch"), action("newFromClipboard"), .separator(),
+            action("newScratch"), action("newFromClipboard"), action("openFile"), action("addExternalFolder"), .separator(),
+            action("save"), .separator(),
             action("renameScratch"), action("deleteScratch"), action("revealScratch"), action("revealInSidebar"), .separator(),
             action("copyPath"), action("copyFile"), .separator(),
             action("compareWithClipboard"), .separator(),
             action("navigateBack"), action("navigateForward"), .separator(),
-            action("recentScratches"), action("nextScratch"), action("previousScratch"), .separator(),
+            action("gotoScratch"), action("gotoSymbol"), action("recentScratches"), action("nextScratch"), action("previousScratch"), .separator(),
             action("commandPalette"), .separator(),
-            item("Close Window", #selector(NSWindow.performClose(_:)), "w"),
+            action("nextTab"), action("previousTab"), action("closeTab"), action("closeOtherTabs"), action("closeAllTabs"),
+            item("Close Window", #selector(NSWindow.performClose(_:)), "w", [.command, .shift]),
         ]))
 
         mainMenu.addItem(submenu("Edit", [
@@ -136,9 +176,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             action("fold"), action("unfold"), action("foldAll"), action("unfoldAll"),
         ]))
 
+        mainMenu.addItem(submenu("Format", [
+            action("formatBold"), action("formatItalic"), action("formatUnderline"), action("formatStrikethrough"), .separator(),
+            action("formatBigger"), action("formatSmaller"), action("formatFonts"), .separator(),
+            action("formatAlignLeft"), action("formatAlignCenter"), action("formatAlignRight"), action("formatJustify"), .separator(),
+            action("formatBulletList"), action("formatNumberedList"), .separator(),
+            action("formatInsertImage"), action("formatClear"),
+        ]))
+
         mainMenu.addItem(submenu("View", [
-            action("toggleSidebar"), action("revealInSidebar"), action("toggleConsole"), action("clearConsole"), .separator(),
-            action("togglePreview"), action("fullPreview"), action("groupByType"), action("groupByDate"), action("toggleFoldersPane"), .separator(),
+            action("toggleSidebar"), action("revealInSidebar"), action("toggleConsole"), action("editorOnly"), action("clearConsole"), .separator(),
+            action("togglePreview"), action("fullPreview"), action("copyRichText"), action("exportPreview"), action("exportPreviewPDF"), action("exportPreviewHTML"), action("exportPreviewMHTML"), .separator(),
+            action("specViewerSwagger"), action("specViewerScalar"), action("specViewerKong"), .separator(), action("groupByType"), action("groupByDate"), action("toggleFoldersPane"), .separator(),
             action("toggleWrap"), action("zoomIn"), action("zoomOut"), action("zoomReset"), .separator(),
             item("Enter Full Screen", #selector(NSWindow.toggleFullScreen(_:)), "f", [.command, .control]),
         ]))

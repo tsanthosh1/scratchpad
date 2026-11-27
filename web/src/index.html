@@ -188,6 +188,51 @@
   .rsp-body .cm-editor { height: 100%; }
 
   #preview iframe { border: 0; width: 100%; height: 100%; background: #fff; }
+  #preview { position: relative; }
+  .preview-actions { display: none; position: sticky; top: 0; height: 0; z-index: 3; justify-content: flex-end; }
+  #preview[data-lang="markdown"] .preview-actions { display: flex; }
+  .preview-actions .rsp-btn { margin: 10px 12px 0 0; opacity: .78; backdrop-filter: blur(6px); }
+  .preview-actions .rsp-btn:hover, .preview-actions .rsp-btn.done { opacity: 1; }
+  .preview-actions .zoom-group {
+    display: inline-flex; align-items: stretch; height: 26px; margin: 10px 12px 0 0; border-radius: 6px; overflow: hidden;
+    border: 1px solid var(--border); background: var(--btn-bg); box-shadow: var(--shadow); opacity: .78; backdrop-filter: blur(6px);
+    transition: opacity .12s;
+  }
+  .preview-actions .zoom-group:hover { opacity: 1; }
+  .zoom-group button {
+    min-width: 26px; padding: 0 6px; border: 0; background: none; color: var(--fg); cursor: pointer;
+    font: 500 13px -apple-system, BlinkMacSystemFont, sans-serif; transition: background-color .12s;
+  }
+  .zoom-group button.zoom-reset { min-width: 44px; font-size: 11.5px; font-variant-numeric: tabular-nums; color: var(--muted); }
+  .zoom-group button:hover { background: var(--btn-hover); color: var(--fg); }
+  .zoom-group button:active { background: var(--btn-active); }
+  .zoom-group button:disabled { color: var(--muted); opacity: .45; cursor: default; background: none; }
+  .zoom-group button + button { border-left: 1px solid var(--border); }
+  #preview[data-lang="csv"], #preview[data-lang="tsv"] { overflow: hidden; }
+  .table-view { display: flex; flex-direction: column; height: 100%; font: 12px -apple-system, BlinkMacSystemFont, sans-serif; }
+  .table-view[hidden] { display: none; }
+  #preview[data-lang="openapi"] { overflow: hidden; }
+  #preview iframe.spec-viewer { display: block; background: transparent; }
+  #preview iframe[hidden] { display: none; }
+  .table-summary { flex: none; padding: 8px 12px; color: var(--muted); background: var(--bar); border-bottom: 1px solid var(--border); }
+  .table-scroll { flex: 1; overflow: auto; }
+  .table-view table { border-collapse: separate; border-spacing: 0; font: 12px/1.45 Menlo, monospace; }
+  .table-view th, .table-view td {
+    padding: 4px 10px; border-right: 1px solid var(--border); border-bottom: 1px solid var(--border);
+    white-space: pre; max-width: 420px; overflow: hidden; text-overflow: ellipsis; text-align: left;
+  }
+  .table-view thead th {
+    position: sticky; top: 0; z-index: 2; background: var(--bar); font: 600 12px -apple-system, sans-serif;
+    border-bottom-color: var(--muted);
+  }
+  .table-view th.row-number {
+    position: sticky; left: 0; z-index: 1; background: var(--bar); color: var(--muted);
+    font: 11px Menlo, monospace; text-align: right; min-width: 28px;
+  }
+  .table-view thead th.row-number { z-index: 3; }
+  .table-view .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .table-view td.missing { background: var(--diff-spacer); }
+  .table-view tbody tr:hover td { background: var(--accent-soft); }
   .markdown-body {
     font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
     padding: 24px 32px 64px; max-width: 900px; margin: 0 auto; word-wrap: break-word;
@@ -195,6 +240,12 @@
   .markdown-body h1, .markdown-body h2 { border-bottom: 1px solid var(--border); padding-bottom: .3em; }
   .markdown-body h1, .markdown-body h2, .markdown-body h3 { margin: 1.4em 0 .6em; line-height: 1.25; }
   .markdown-body a { color: var(--link); text-decoration: none; }
+  .markdown-body .mermaid-diagram { margin: 1em 0; overflow-x: auto; text-align: center; }
+  .markdown-body .mermaid-diagram:not([data-drawn]) { min-height: 2em; }
+  .markdown-body .mermaid-diagram svg { max-width: 100%; height: auto; }
+  .markdown-body .mermaid-error { color: #d1242f; font-size: 12px; text-align: left; margin-bottom: 4px; }
+  .markdown-body .mermaid-diagram pre { text-align: left; }
+  .markdown-body .preview-note { color: var(--muted); font-style: italic; border-top: 1px solid var(--border); padding-top: .6em; }
   .markdown-body a:hover { text-decoration: underline; }
   .markdown-body code { font: 85% Menlo, monospace; background: var(--code-bg); padding: .2em .4em; border-radius: 4px; }
   .markdown-body pre { background: var(--code-bg); padding: 12px 16px; border-radius: 6px; overflow: auto; }
@@ -214,15 +265,21 @@
     display: flex; align-items: center; gap: 10px; height: 40px; padding: 0 10px; flex: none; background: var(--bar);
     border-bottom: 1px solid var(--border); font: 12px -apple-system, BlinkMacSystemFont, sans-serif;
   }
-  .diff-header .names { flex: 1; display: flex; min-width: 0; gap: 10px; }
-  .diff-header .names span {
-    flex: 1; display: flex; align-items: center; gap: 6px; font-weight: 600; min-width: 0;
+  .diff-header .diff-spacer { flex: 1; }
+  .diff-names {
+    display: flex; flex: none; height: 28px; background: var(--bar); border-bottom: 1px solid var(--border);
+    font: 600 12px -apple-system, BlinkMacSystemFont, sans-serif;
+  }
+  .diff-names span {
+    flex: 1 1 0; min-width: 0; padding: 0 12px; line-height: 28px;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
-  .diff-header .names span::before {
-    content: ""; flex: none; width: 8px; height: 8px; border-radius: 2px; background: var(--err);
+  .diff-names span + span { border-left: 1px solid var(--border); }
+  .diff-names span::before {
+    content: ""; display: inline-block; width: 8px; height: 8px; margin: -1px 7px 0 0; vertical-align: middle;
+    border-radius: 2px; background: var(--err);
   }
-  .diff-header .names span.diff-b::before { background: var(--ok); }
+  .diff-names span.diff-b::before { background: var(--ok); }
   .diff-stats {
     display: inline-flex; align-items: center; height: 22px; padding: 0 10px; border-radius: 11px;
     font-weight: 600; white-space: nowrap; color: var(--warn); background: var(--warn-bg);
@@ -349,6 +406,13 @@
     background: transparent; color: var(--muted); font-size: 16px; line-height: 20px; cursor: pointer;
   }
   :is(#main, #diff) .cm-editor .cm-panel.cm-search button[name=close]:hover { background: var(--btn-hover); color: var(--fg); }
+  :is(#main, #diff) .cm-editor .cm-panel.cm-search .cm-search-count {
+    min-width: 64px; color: var(--muted); font-size: 11.5px; font-variant-numeric: tabular-nums; white-space: nowrap;
+  }
+  :is(#main, #diff) .cm-editor .cm-panel.cm-search .cm-search-count.none { color: #e5534b; }
+  :is(#main, #diff) .cm-editor .cm-panel.cm-search .cm-textfield.cm-search-invalid { border-color: #e5534b; }
+  :is(#main, #diff) .cm-editor .cm-panel.cm-search button[name=prev],
+  :is(#main, #diff) .cm-editor .cm-panel.cm-search button[name=next] { padding: 0 8px; font-size: 13px; }
   :is(#main, #diff) .cm-editor .cm-panel.cm-gotoLine { padding: 7px 10px; font: 12px -apple-system, sans-serif; }
   :is(#main, #diff) .cm-editor .cm-panel.cm-gotoLine input {
     height: 26px; box-sizing: border-box; padding: 0 8px; border-radius: 6px; border: 1px solid var(--border);
@@ -382,16 +446,20 @@
   <div id="response-resizer" title="Drag to resize · double-click to reset"></div>
   <section id="response" aria-label="HTTP response"></section>
   <section id="diffdoc" aria-label="Diff"></section>
-  <div id="preview"><article class="markdown-body"></article><iframe sandbox title="HTML preview" hidden></iframe></div>
+  <div id="preview">
+    <div class="preview-actions"><div class="zoom-group" role="group" aria-label="Preview zoom"><button class="zoom-out" title="Zoom out (⌘−)" aria-label="Zoom out">−</button><button class="zoom-reset" title="Actual size (⌘0)">100%</button><button class="zoom-in" title="Zoom in (⌘+)" aria-label="Zoom in">+</button></div><button class="rsp-btn copy-rich" title="Copy the rendered preview as rich text, for Mail, Notes, Docs or Slack"><svg viewBox="0 0 16 16"><path d="M5.75 1h6.5C13.22 1 14 1.78 14 2.75v6.5c0 .97-.78 1.75-1.75 1.75H11v1.25c0 .97-.78 1.75-1.75 1.75h-6.5C1.78 14 1 13.22 1 12.25v-6.5C1 4.78 1.78 4 2.75 4H4V2.75C4 1.78 4.78 1 5.75 1zM5.5 4h3.75C10.22 4 11 4.78 11 5.75V9.5h1.25a.25.25 0 0 0 .25-.25v-6.5a.25.25 0 0 0-.25-.25h-6.5a.25.25 0 0 0-.25.25zm-2.75 1.5a.25.25 0 0 0-.25.25v6.5c0 .14.11.25.25.25h6.5a.25.25 0 0 0 .25-.25v-6.5a.25.25 0 0 0-.25-.25z"/></svg><span>Copy</span></button><button class="rsp-btn export-preview" title="Export the preview as PDF, HTML or MHTML"><svg viewBox="0 0 16 16"><path d="M7.47 10.78a.75.75 0 0 0 1.06 0l3.25-3.25a.75.75 0 0 0-1.06-1.06L8.75 8.44V1.75a.75.75 0 0 0-1.5 0v6.69L5.28 6.47a.75.75 0 0 0-1.06 1.06zM2.75 11a.75.75 0 0 1 .75.75v1.5c0 .14.11.25.25.25h8.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 12.25 15h-8.5A1.75 1.75 0 0 1 2 13.25v-1.5a.75.75 0 0 1 .75-.75z"/></svg><span>Export</span></button></div>
+    <article class="markdown-body"></article><iframe sandbox title="HTML preview" hidden></iframe><div class="table-view" hidden></div><iframe class="spec-viewer" title="API viewer" hidden></iframe>
+  </div>
 </div>
 <div id="diff" hidden>
   <div class="diff-header">
-    <div class="names"><span class="diff-a"></span><span class="diff-b"></span></div>
     <span class="diff-stats"></span>
+    <span class="diff-spacer"></span>
     <span class="diff-tools"></span>
     <span class="rsp-divider"></span>
     <button class="rsp-btn diff-close" title="Close (Esc)"><svg viewBox="0 0 16 16"><path d="M3.7 3.7a.75.75 0 0 1 1.06 0L8 6.94l3.24-3.24a.75.75 0 1 1 1.06 1.06L9.06 8l3.24 3.24a.75.75 0 1 1-1.06 1.06L8 9.06l-3.24 3.24a.75.75 0 0 1-1.06-1.06L6.94 8 3.7 4.76a.75.75 0 0 1 0-1.06z"/></svg>Close Diff</button>
   </div>
+  <div class="diff-names"><span class="diff-a"></span><span class="diff-b"></span></div>
   <div class="diff-body"></div>
 </div>
 <script src="editor.bundle.js"></script>

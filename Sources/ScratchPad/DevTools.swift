@@ -37,6 +37,10 @@ enum DevTools {
               summary: "Unix epoch ↔ dates in any zone", keywords: "epoch unix date time millis iso", makePage: TimePage.init),
         .init(id: "generate", title: "Generators", symbol: "wand.and.stars", tint: .systemYellow,
               summary: "UUIDs and random strings", keywords: "uuid guid random password", makePage: GeneratorPage.init),
+        .init(id: "mcp", title: "MCP Tester", symbol: "network", tint: .systemIndigo,
+              summary: "Test MCP servers, validate connection and list tools",
+              keywords: "mcp model context protocol server test tools npx stdio sse rpc remote claude",
+              makePage: MCPTesterPage.init),
     ]
 
     static let byId = Dictionary(uniqueKeysWithValues: all.map { ($0.id, $0) })

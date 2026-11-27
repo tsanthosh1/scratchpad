@@ -33,16 +33,19 @@ enum ToolbarStyle {
 final class ToolbarGroup: NSView {
     private let stack = NSStackView()
     private let compact: Bool
+    /// No capsule of its own: the toolbar's Liquid Glass (macOS 26) already draws one around the item.
+    private let bare: Bool
 
-    init(_ views: [NSView], compact: Bool = false) {
+    init(_ views: [NSView], compact: Bool = false, bare: Bool = false) {
         self.compact = compact
+        self.bare = bare
         super.init(frame: .zero)
         wantsLayer = true
         layer?.cornerRadius = ToolbarStyle.corner
         layer?.cornerCurve = .continuous
-        layer?.borderWidth = compact ? 0 : 0.5
-        stack.spacing = 1
-        stack.edgeInsets = compact ? NSEdgeInsets() : NSEdgeInsets(top: 2, left: 2, bottom: 2, right: 2)
+        layer?.borderWidth = compact || bare ? 0 : 0.5
+        stack.spacing = bare ? 2 : 1
+        stack.edgeInsets = compact || bare ? NSEdgeInsets() : NSEdgeInsets(top: 2, left: 2, bottom: 2, right: 2)
         stack.translatesAutoresizingMaskIntoConstraints = false
         addSubview(stack)
         NSLayoutConstraint.activate([
@@ -71,7 +74,7 @@ final class ToolbarGroup: NSView {
 
     override func updateLayer() {
         effectiveAppearance.performAsCurrentDrawingAppearance {
-            layer?.backgroundColor = compact ? nil : NSColor.labelColor.withAlphaComponent(0.045).cgColor
+            layer?.backgroundColor = compact || bare ? nil : NSColor.labelColor.withAlphaComponent(0.045).cgColor
             layer?.borderColor = NSColor.labelColor.withAlphaComponent(0.1).cgColor
         }
     }

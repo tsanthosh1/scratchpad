@@ -20,6 +20,7 @@ protocol EditorControllerDelegate: AnyObject {
     func editor(_ editor: EditorController, didPasteCurl text: String, separatorBefore: Bool, separatorAfter: Bool)
     func editor(_ editor: EditorController, runRequestAt offset: Int)
     func editor(_ editor: EditorController, openResponse text: String, language: Language)
+    func editor(_ editor: EditorController, showMessage text: String)
 }
 
 enum PreviewMode: String {
@@ -38,7 +39,11 @@ final class EditorController: NSObject {
     weak var delegate: EditorControllerDelegate?
     let webView: WKWebView
     private(set) var isReady = false
-    private var queued: [String] = []
+    /// Whether the open document has a preview: Markdown, HTML, CSV/TSV, or YAML/JSON holding an OpenAPI spec.
+    private(set) var previewAvailable = false
+    /// What the preview shows ("markdown", "openapi", "html", "csv"…), nil when there's none.
+    private(set) var previewKind: String?
+    private var queued: [(script: String, arguments: [String: Any])] = []
 
     override init() {
         let config = WKWebViewConfiguration()
@@ -65,7 +70,8 @@ final class EditorController: NSObject {
     // MARK: API
 
     func load(id: String, text: String, language: Language) {
-        call("ScratchEditor.load(\(js(id)), \(js(text)), \(js(language.rawValue)))")
+        // Passed as arguments rather than spliced into the script, so large documents aren't re-parsed as JS source.
+        call("ScratchEditor.load(id, text, language)", arguments: ["id": id, "text": text, "language": language.rawValue])
     }
 
     func forget(id: String) {
@@ -154,12 +160,19 @@ final class EditorController: NSObject {
         call("ScratchEditor.insertAtCursors(\(js(text)))")
     }
 
+    /// Copies the rendered Markdown preview as rich text; false when the open scratch isn't Markdown.
+    func copyRichText() {
+        call("ScratchEditor.copyRichText()")
+    }
+
     func setPreview(_ mode: PreviewMode) {
         call("ScratchEditor.setPreview(\(js(mode.rawValue)))")
     }
 
     func showDiff(left: (name: String, text: String), right: (name: String, text: String), language: Language) {
-        call("ScratchEditor.showDiff(\(js(left.name)), \(js(left.text)), \(js(right.name)), \(js(right.text)), \(js(language.rawValue)))")
+        call("ScratchEditor.showDiff(aName, aText, bName, bText, language)",
+             arguments: ["aName": left.name, "aText": left.text, "bName": right.name, "bText": right.text,
+                         "language": language.rawValue])
     }
 
     // MARK: HTTP response panel
@@ -177,6 +190,52 @@ final class EditorController: NSObject {
     }
 
     /// Selects a UTF-16 range in the current document and scrolls it into view.
+    /// The open document's outline for Go to Symbol (nil if the editor isn't ready).
+    func symbols(completion: @escaping (_ symbols: [DocumentSymbol], _ cursor: Int, _ truncated: Bool) -> Void) {
+        guard isReady else { return completion([], 0, false) }
+        webView.evaluateJavaScript("ScratchEditor.symbols()") { result, error in
+            if let error { NSLog("ScratchPad: symbols failed: \(error)") }
+            let dict = result as? [String: Any] ?? [:]
+            let rows = dict["symbols"] as? [[Any]] ?? []
+            completion(rows.compactMap(DocumentSymbol.init(row:)), dict["cursor"] as? Int ?? 0, dict["truncated"] as? Bool ?? false)
+        }
+    }
+
+    /// `step` +1/-1 zooms the Markdown preview in or out, 0 resets it; false when the preview isn't the focus.
+    func zoomPreview(_ step: Int, completion: @escaping (Bool) -> Void) {
+        guard isReady else { return completion(false) }
+        webView.evaluateJavaScript("ScratchEditor.zoomPreview(\(step))") { result, _ in completion(result as? Bool ?? false) }
+    }
+
+    func setSpecViewer(_ viewer: SpecViewer) {
+        call("ScratchEditor.setSpecViewer(viewer)", arguments: ["viewer": viewer.rawValue])
+    }
+
+    /// The Markdown preview as a standalone page (nil for other languages); `forPrint` keeps blocks whole across pages.
+    func previewDocument(title: String, forPrint: Bool, completion: @escaping (String?) -> Void) {
+        guard isReady else { return completion(nil) }
+        webView.callAsyncJavaScript("return await ScratchEditor.previewDocument(title, mode)",
+                                    arguments: ["title": title, "mode": forPrint ? "print" : "html"],
+                                    in: nil, in: .page) { result in
+            if case .failure(let error) = result { NSLog("ScratchPad: preview export failed: \(error)") }
+            completion((try? result.get()) as? String)
+        }
+    }
+
+    /// Scrolls to a symbol and marks its line, without moving the cursor.
+    func peekSymbol(at offset: Int) {
+        call("ScratchEditor.peekSymbol(\(offset))")
+    }
+
+    /// Selects the chosen symbol's name, or (nil) scrolls back to where the picker was opened.
+    func endSymbolPeek(select range: NSRange?) {
+        if let range {
+            call("ScratchEditor.endSymbolPeek(\(range.location), \(range.location + range.length))")
+        } else {
+            call("ScratchEditor.endSymbolPeek(null, null)")
+        }
+    }
+
     func reveal(_ range: NSRange) {
         call("ScratchEditor.reveal(\(range.location), \(range.location + range.length))")
     }
@@ -204,13 +263,19 @@ final class EditorController: NSObject {
 
     // MARK: Plumbing
 
-    private func call(_ script: String) {
+    private func call(_ script: String, arguments: [String: Any] = [:]) {
         guard isReady else {
-            queued.append(script)
+            queued.append((script, arguments))
             return
         }
-        webView.evaluateJavaScript(script) { _, error in
-            if let error { NSLog("ScratchPad JS error: \(error) in \(script.prefix(120))") }
+        if arguments.isEmpty {
+            webView.evaluateJavaScript(script) { _, error in
+                if let error { NSLog("ScratchPad JS error: \(error) in \(script.prefix(120))") }
+            }
+        } else {
+            webView.callAsyncJavaScript(script, arguments: arguments, in: nil, in: .page) { result in
+                if case .failure(let error) = result { NSLog("ScratchPad JS error: \(error) in \(script.prefix(120))") }
+            }
         }
     }
 
@@ -230,9 +295,10 @@ final class EditorController: NSObject {
             isReady = true
             applySettings()
             applyKeymap()
+            setSpecViewer(Settings.shared.specViewer)
             let pending = queued
             queued.removeAll()
-            pending.forEach(call)
+            pending.forEach { call($0.script, arguments: $0.arguments) }
             delegate?.editorDidBecomeReady(self)
         case "change":
             if let id = body["id"] as? String, let text = body["text"] as? String {
@@ -251,6 +317,8 @@ final class EditorController: NSObject {
         case "action":
             if let id = body["id"] as? String { delegate?.editor(self, requestsAction: id) }
         case "previewMode":
+            previewAvailable = body["available"] as? Bool ?? false
+            previewKind = body["kind"] as? String
             if let mode = PreviewMode(rawValue: body["mode"] as? String ?? "") {
                 delegate?.editor(self, previewModeDidChange: mode)
             }
@@ -271,6 +339,13 @@ final class EditorController: NSObject {
                 let language = Language(rawValue: body["language"] as? String ?? "") ?? Language.detect(text)
                 delegate?.editor(self, openResponse: text, language: language)
             }
+        case "copyRich":
+            if let html = body["html"] as? String, let text = body["text"] as? String {
+                RichClipboard.write(html: html, text: text)
+                delegate?.editor(self, showMessage: "Copied the preview as rich text")
+            }
+        case "message":
+            if let text = body["text"] as? String { delegate?.editor(self, showMessage: text) }
         case "runRequest":
             if let offset = body["offset"] as? Int { delegate?.editor(self, runRequestAt: offset) }
         case "openURL":
@@ -288,14 +363,17 @@ extension EditorController: WKNavigationDelegate {
     // Keep the editor page in place: dropping a file or clicking a link must not navigate away.
     func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction,
                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
-        // The sandboxed HTML preview iframe loads via srcdoc; links clicked inside it open externally.
+        // The sandboxed HTML preview iframe loads via srcdoc and the OpenAPI viewer frame loads the bundled
+        // viewer.html; links clicked inside them open externally.
         if let frame = action.targetFrame, !frame.isMainFrame {
             if action.navigationType == .linkActivated, let url = action.request.url,
                ["http", "https", "mailto"].contains(url.scheme?.lowercased() ?? "") {
                 NSWorkspace.shared.open(url)
                 return decisionHandler(.cancel)
             }
-            return decisionHandler(action.request.url?.scheme == "about" ? .allow : .cancel)
+            let url = action.request.url
+            let isViewer = url?.isFileURL == true && url?.lastPathComponent == "viewer.html"
+            return decisionHandler(url?.scheme == "about" || isViewer ? .allow : .cancel)
         }
         let isEditorPage = (action.navigationType == .other || action.navigationType == .reload)
             && action.request.url?.isFileURL == true && action.request.url?.lastPathComponent == "index.html"
@@ -343,5 +421,113 @@ private final class EditorWebView: WKWebView {
             return id.hasPrefix("WKMenuItemIdentifier") && !keep.contains(id)
         }
         super.willOpenMenu(menu, with: event)
+    }
+}
+
+/// Writes formatted content the way browsers do: HTML for apps that take it, RTF for the rest
+/// (TextEdit, older Cocoa apps), and plain text as the fallback.
+enum RichClipboard {
+    static func write(html: String, text: String) {
+        let page = "<html><head><meta charset=\"utf-8\"></head><body style=\"font-family: -apple-system, Helvetica, sans-serif\">\(html)</body></html>"
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(page, forType: .html)
+        if let data = page.data(using: .utf8),
+           let attributed = try? NSAttributedString(data: data, options: [
+               .documentType: NSAttributedString.DocumentType.html, .characterEncoding: String.Encoding.utf8.rawValue,
+           ], documentAttributes: nil),
+           let rtf = try? attributed.data(from: NSRange(location: 0, length: attributed.length),
+                                          documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf]) {
+            pb.setData(rtf, forType: .rtf)
+        }
+        pb.setString(text, forType: .string)
+    }
+}
+
+/// One entry of a document's outline. Offsets are UTF-16, like NSString's.
+struct DocumentSymbol {
+    let name: String
+    let kind: String
+    /// What gets selected when you jump to it (usually the name).
+    let range: NSRange
+    /// Where the symbol's body ends, to tell which symbol the cursor is in.
+    let end: Int
+    let depth: Int
+    let line: Int
+    let container: String
+    let detail: String
+
+    init(name: String, kind: String, range: NSRange, end: Int, depth: Int, line: Int, container: String = "", detail: String = "") {
+        self.name = name
+        self.kind = kind
+        self.range = range
+        self.end = end
+        self.depth = depth
+        self.line = line
+        self.container = container
+        self.detail = detail
+    }
+
+    init?(row: [Any]) {
+        guard row.count >= 9, let name = row[0] as? String, let kind = row[1] as? String,
+              let from = row[2] as? Int, let to = row[3] as? Int else { return nil }
+        self.init(name: name, kind: kind, range: NSRange(location: from, length: max(0, to - from)),
+                  end: row[4] as? Int ?? to, depth: row[5] as? Int ?? 0, line: row[6] as? Int ?? 1,
+                  container: row[7] as? String ?? "", detail: row[8] as? String ?? "")
+    }
+
+    /// Icon and colour for the picker row, by kind.
+    var tile: (symbol: String, tint: NSColor) {
+        switch kind {
+        case "class", "schema": return ("c.square.fill", .systemOrange)
+        case "struct": return ("s.square.fill", .systemOrange)
+        case "interface": return ("i.square.fill", .systemTeal)
+        case "enum": return ("e.square.fill", .systemYellow)
+        case "enumMember": return ("e.circle", .systemYellow)
+        case "function": return ("f.square.fill", .systemPurple)
+        case "method": return ("m.square.fill", .systemPurple)
+        case "constructor": return ("hammer.fill", .systemPurple)
+        case "property", "field": return ("p.square.fill", .systemBlue)
+        case "variable": return ("v.square.fill", .systemBlue)
+        case "constant": return ("k.square.fill", .systemIndigo)
+        case "type": return ("t.square.fill", .systemTeal)
+        case "namespace", "module": return ("shippingbox.fill", .systemBrown)
+        case "test": return ("checkmark.diamond.fill", .systemGreen)
+        case "selector": return ("number", .systemPink)
+        case "atRule": return ("at", .systemPink)
+        case "object": return ("curlybraces", .systemYellow)
+        case "array": return ("square.stack.3d.up", .systemOrange)
+        case "string": return ("textformat.abc", .systemRed)
+        case "number": return ("number", .systemBlue)
+        case "boolean": return ("switch.2", .systemGreen)
+        case "null": return ("circle.slash", .systemGray)
+        case "key": return ("key.fill", .systemTeal)
+        case "element": return ("chevron.left.forwardslash.chevron.right", .systemRed)
+        case "heading": return ("textformat.size", .systemBlue)
+        case "section": return ("bookmark.fill", .systemGray)
+        case "table": return ("tablecells", .systemTeal)
+        case "view": return ("eye", .systemTeal)
+        case "index": return ("list.bullet.indent", .systemGray)
+        case "cte": return ("square.on.square", .systemGray)
+        case "query": return ("magnifyingglass", .systemIndigo)
+        case "statement": return ("text.alignleft", .systemGray)
+        case "event": return ("bolt.fill", .systemYellow)
+        case "request", "operation": return ("network", .systemGreen)
+        case "route": return ("arrow.triangle.branch", .systemGreen)
+        case "component": return ("puzzlepiece.fill", .systemGray)
+        case "column": return ("rectangle.split.3x1", .systemGreen)
+        case "document": return ("doc.fill", .systemGray)
+        default: return ("circle.fill", .systemGray)
+        }
+    }
+
+    /// "method", "enum member", "at-rule"… for the picker's kind filter and search.
+    var kindLabel: String {
+        switch kind {
+        case "enumMember": return "enum member"
+        case "atRule": return "at-rule"
+        case "cte": return "CTE"
+        default: return kind
+        }
     }
 }

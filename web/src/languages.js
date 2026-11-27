@@ -18,6 +18,7 @@ import { properties } from '@codemirror/legacy-modes/mode/properties';
 import { kotlin } from '@codemirror/legacy-modes/mode/clike';
 
 import { http } from './http.js';
+import { csv } from './csv.js';
 
 const legacy = (mode) => () => new LanguageSupport(StreamLanguage.define(mode));
 
@@ -34,6 +35,8 @@ const base = {
   css: () => css(),
   sql: () => sql(),
   yaml: () => yaml(),
+  // OpenAPI specs are YAML or JSON; YAML highlighting covers both (JSON is valid YAML).
+  openapi: () => yaml(),
   toml: legacy(toml),
   properties: legacy(properties),
   kotlin: legacy(kotlin),
@@ -41,6 +44,8 @@ const base = {
   rust: () => rust(),
   cpp: () => cpp(),
   text: () => [],
+  csv: () => csv(),
+  tsv: () => csv('\t'),
 };
 
 const aliases = {
@@ -50,7 +55,7 @@ const aliases = {
 
 // Fenced code blocks inside Markdown get the same highlighting as standalone scratches.
 const codeLanguages = Object.entries(base)
-  .filter(([name]) => name !== 'text')
+  .filter(([name]) => !['text', 'csv', 'tsv', 'openapi'].includes(name))
   .map(([name, make]) => LanguageDescription.of({ name, alias: aliases[name] ?? [], support: make() }));
 
 export const languages = {

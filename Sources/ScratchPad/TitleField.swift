@@ -23,15 +23,25 @@ final class TitleField: NSTextField, NSTextFieldDelegate {
         delegate = self
         toolTip = "Double-click to rename"
         setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        setContentHuggingPriority(.defaultHigh, for: .horizontal)
         widthAnchor.constraint(greaterThanOrEqualToConstant: 120).isActive = true
         widthAnchor.constraint(lessThanOrEqualToConstant: 420).isActive = true
+        heightAnchor.constraint(equalToConstant: 24).isActive = true
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
+    override var intrinsicContentSize: NSSize {
+        let textWidth = (stringValue as NSString).size(withAttributes: [.font: font ?? .systemFont(ofSize: 13, weight: .semibold)]).width
+        let padding: CGFloat = isRenaming ? 24 : 8
+        let width = max(120, min(420, ceil(textWidth + padding)))
+        return NSSize(width: width, height: 24)
+    }
+
     func show(_ name: String) {
         guard !isRenaming else { return }
         stringValue = name
+        invalidateIntrinsicContentSize()
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -48,9 +58,10 @@ final class TitleField: NSTextField, NSTextFieldDelegate {
         isBezeled = true
         bezelStyle = .roundedBezel
         drawsBackground = true
+        invalidateIntrinsicContentSize()
         window.makeFirstResponder(self)
         // Select the name without the extension, like Finder.
-        let stem = (original as NSString).deletingPathExtension
+        let stem = Language.stem(of: original)
         currentEditor()?.selectedRange = NSRange(location: 0, length: (stem as NSString).length)
     }
 
@@ -61,6 +72,10 @@ final class TitleField: NSTextField, NSTextFieldDelegate {
             return true
         }
         return false
+    }
+
+    func controlTextDidChange(_ obj: Notification) {
+        invalidateIntrinsicContentSize()
     }
 
     func controlTextDidEndEditing(_ obj: Notification) {
@@ -76,5 +91,6 @@ final class TitleField: NSTextField, NSTextFieldDelegate {
         } else {
             onRename?(newName)
         }
+        invalidateIntrinsicContentSize()
     }
 }

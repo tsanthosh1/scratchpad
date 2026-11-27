@@ -1,8 +1,8 @@
 import {
   EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter,
-  drawSelection, dropCursor, rectangularSelection, crosshairCursor, highlightSpecialChars,
+  drawSelection, dropCursor, rectangularSelection, crosshairCursor, highlightSpecialChars, Decoration,
 } from '@codemirror/view';
-import { EditorState, EditorSelection, Compartment, Prec } from '@codemirror/state';
+import { EditorState, EditorSelection, Compartment, Prec, StateEffect, StateField } from '@codemirror/state';
 import {
   history, standardKeymap, historyKeymap, indentWithTab, undo, redo, selectAll,
   copyLineDown, deleteLine, moveLineUp, moveLineDown, toggleComment, toggleBlockComment,
@@ -27,6 +27,9 @@ import { DiffPanel, DiffWorkspace, diffOptions } from './diff.js';
 import { ResponsePanel, newRun, applyResult, finishRun, toneOf, formatElapsed } from './response.js';
 import { setRunning, setChip, setChipHandler, setRunShortcut, runState } from './http.js';
 import { storage } from './storage.js';
+import { parseCSV, serializeCSV, detectDelimiter, rowsFromHTML, delimiterName } from './csv.js';
+import { documentSymbols } from './symbols.js';
+import { createFindPanel } from './findPanel.js';
 
 const post = (msg) => window.webkit?.messageHandlers?.bridge?.postMessage(msg);
 const languageSupport = (name) => {
@@ -126,7 +129,22 @@ let settings = { fontSize: 13, fontFamily: 'Menlo', tabSize: 2, lineWrap: false,
 let editorBindings = {};
 let appBindings = {};
 let current = { id: null, language: 'text' };
+// Editor states of recently open documents (undo history, selection, scroll), least recently used first.
+// Bounded so browsing many or large files doesn't keep all of them in memory.
 const stateCache = new Map();
+const STATE_CACHE_ENTRIES = 12;
+const STATE_CACHE_CHARS = 4_000_000;
+function cacheState(id, state) {
+  stateCache.delete(id);
+  stateCache.set(id, state);
+  let chars = 0;
+  for (const s of stateCache.values()) chars += s.doc.length;
+  for (const [key, s] of stateCache) {
+    if (stateCache.size <= STATE_CACHE_ENTRIES && chars <= STATE_CACHE_CHARS) break;
+    stateCache.delete(key);
+    chars -= s.doc.length;
+  }
+}
 
 function settingsExtension() {
   return [
@@ -142,13 +160,15 @@ function settingsExtension() {
 
 // App-level shortcuts are also registered here so they work reliably while the editor has focus
 // (e.g. ⇧⌘8, which menu key equivalents match inconsistently); they are forwarded to native.
+// An action may have several shortcuts (a list); older native builds sent one string.
+const keysOf = (value) => (Array.isArray(value) ? value : value ? [value] : []).filter(Boolean);
 function userKeymapExtension() {
   const bindings = [];
-  for (const [name, key] of Object.entries(editorBindings)) {
-    if (key && commands[name]) bindings.push({ key, run: commands[name] });
+  for (const [name, keys] of Object.entries(editorBindings)) {
+    if (commands[name]) for (const key of keysOf(keys)) bindings.push({ key, run: commands[name] });
   }
-  for (const [id, key] of Object.entries(appBindings)) {
-    if (key) bindings.push({ key, run: () => (post({ type: 'action', id }), true) });
+  for (const [id, keys] of Object.entries(appBindings)) {
+    for (const key of keysOf(keys)) bindings.push({ key, run: () => (post({ type: 'action', id }), true) });
   }
   return Prec.highest(keymap.of(bindings));
 }
@@ -170,7 +190,10 @@ function flush() {
 function scheduleSave() {
   if (!current.id) return;
   if (pendingChange) clearTimeout(pendingChange.timer);
-  pendingChange = { id: current.id, timer: setTimeout(flush, 250) };
+  // Each save sends the whole text to native, so big documents wait for a longer pause.
+  const length = view.state.doc.length;
+  const delay = length < 200_000 ? 250 : length < 2_000_000 ? 800 : 1500;
+  pendingChange = { id: current.id, timer: setTimeout(flush, delay) };
 }
 
 let statusFrame = 0;
@@ -199,7 +222,10 @@ const listener = EditorView.updateListener.of((u) => {
     else {
       const pasted = u.transactions.some((t) => t.isUserEvent('input.paste'));
       if (pasted && u.startState.doc.length === 0) post({ type: 'pasteIntoEmpty', id: current.id });
-      if (previewMode !== 'off') preview.scheduleRender(current.language, u.state.doc.toString());
+      // Typing can turn a YAML/JSON file into an OpenAPI spec (or stop it being one), which shows or hides the preview.
+      const kind = previewKind(u.state.doc);
+      if (u.changes.touchesRange(0, 20_000) && kind !== previewKind(u.startState.doc)) applyPreviewMode();
+      else if (previewMode !== 'off' && kind) preview.scheduleRender(kind, u.state.doc);
     }
   }
   if (u.docChanged) expandStack = [];
@@ -227,9 +253,60 @@ const curlPaste = EditorView.domEventHandlers({
   },
 });
 
+const isTable = (language) => language === 'csv' || language === 'tsv';
+
+// Pasting rows into a CSV/TSV scratch converts them to the file's delimiter: cells copied from a
+// spreadsheet (tabs) become CSV, semicolon exports become commas, HTML tables become rows.
+const tablePaste = EditorView.domEventHandlers({
+  paste(event, view) {
+    if (!isTable(current.language)) return false;
+    const plain = event.clipboardData?.getData('text/plain') ?? '';
+    const html = event.clipboardData?.getData('text/html') ?? '';
+    const { doc } = view.state;
+    const target = current.language === 'tsv' ? '\t'
+      : (doc.length > 0 ? detectDelimiter(doc.sliceString(0, Math.min(doc.length, 8000))) : null) ?? ',';
+    const source = detectDelimiter(plain);
+    let rows = null;
+    if (source && source !== target) rows = parseCSV(plain, source);
+    else if (!source && /<table[\s>]/i.test(html)) rows = rowsFromHTML(html);
+    if (!rows?.length) return false;
+    event.preventDefault();
+    let out = serializeCSV(rows, target);
+    const { from } = view.state.selection.main;
+    const atLineStart = from === doc.lineAt(from).from;
+    if (atLineStart && from < doc.length && !out.endsWith('\n')) out += '\n';
+    view.dispatch({ ...view.state.replaceSelection(out), userEvent: 'input.paste', scrollIntoView: true });
+    post({
+      type: 'message',
+      text: `Pasted ${rows.length} row${rows.length === 1 ? '' : 's'}`
+        + (source ? ` (${delimiterName(source)}-separated → ${delimiterName(target)}-separated)` : ' from a table'),
+    });
+    return true;
+  },
+});
+
+// Go to Symbol: the line of the highlighted symbol is marked while the picker is open.
+const setSymbolPeek = StateEffect.define();
+const symbolPeekLine = Decoration.line({ class: 'cm-symbolPeek' });
+const symbolPeekField = StateField.define({
+  create: () => Decoration.none,
+  update(deco, tr) {
+    for (const e of tr.effects) {
+      if (e.is(setSymbolPeek)) {
+        return e.value == null ? Decoration.none : Decoration.set([symbolPeekLine.range(tr.state.doc.lineAt(e.value).from)]);
+      }
+    }
+    return tr.docChanged ? Decoration.none : deco;
+  },
+  provide: (f) => EditorView.decorations.from(f),
+});
+let symbolPeek = null;
+
 function extensions(language) {
   return [
     curlPaste,
+    symbolPeekField,
+    tablePaste,
     lineNumbers(),
     highlightActiveLineGutter(),
     highlightSpecialChars(),
@@ -245,7 +322,7 @@ function extensions(language) {
     crosshairCursor(),
     highlightActiveLine(),
     highlightSelectionMatches(),
-    search({ top: true }),
+    search({ top: true, createPanel: createFindPanel }),
     keymapConf.of(userKeymapExtension()),
     keymap.of([
       ...closeBracketsKeymap,
@@ -265,6 +342,8 @@ function extensions(language) {
       '&': { height: '100%' },
       '.cm-scroller': { overflow: 'auto' },
       '&.cm-focused': { outline: 'none' },
+      '.cm-content': { padding: '12px 0 24px 0' },
+      '.cm-symbolPeek': { backgroundColor: 'rgba(255, 196, 0, 0.18)', boxShadow: 'inset 3px 0 0 rgba(255, 170, 0, 0.9)' },
     }),
   ];
 }
@@ -283,14 +362,17 @@ function mergeExtensions(syntax) {
     history(),
     drawSelection(),
     highlightSelectionMatches(),
-    search({ top: true }),
+    search({ top: true, createPanel: createFindPanel }),
     keymapConf.of(userKeymapExtension()),
     keymap.of([...standardKeymap, ...historyKeymap, ...searchKeymap.filter((b) => b.key === 'Escape'), indentWithTab]),
     themeConf.of(themeFor()),
     settingsConf.of(settingsExtension()),
     languageConf.of(languageSupport(syntax)),
     EditorView.updateListener.of((u) => { if (u.selectionSet || u.docChanged) postStatus(); }),
-    EditorView.theme({ '&.cm-focused': { outline: 'none' } }),
+    EditorView.theme({
+      '&.cm-focused': { outline: 'none' },
+      '.cm-content': { padding: '12px 0 24px 0' },
+    }),
   ];
 }
 
@@ -342,13 +424,28 @@ darkQuery.addEventListener('change', () => {
 const preview = new Preview(document.getElementById('preview'));
 let previewMode = 'off'; // 'off' | 'split' | 'full'
 
+const OPENAPI_YAML = /^["']?(?:openapi|swagger)["']?\s*:\s*["']?\d/m;
+const OPENAPI_JSON = /"(?:openapi|swagger)"\s*:\s*"\d/;
+
+/** What the preview shows for the open document, or null when it has none. */
+function previewKind(doc = view.state.doc) {
+  const language = current.language;
+  if (['markdown', 'html', 'csv', 'tsv'].includes(language)) return language;
+  if (language === 'openapi') return 'openapi';
+  if (language === 'yaml' || language === 'json') {
+    const head = doc.sliceString(0, 20_000);
+    if ((language === 'yaml' ? OPENAPI_YAML : OPENAPI_JSON).test(head)) return 'openapi';
+  }
+  return null;
+}
+
 function applyPreviewMode() {
-  const canPreview = current.language === 'markdown' || current.language === 'html';
-  const mode = canPreview ? previewMode : 'off';
+  const kind = isDiffDoc() ? null : previewKind();
+  const mode = kind ? previewMode : 'off';
   document.body.dataset.preview = mode;
-  if (mode !== 'off') preview.render(current.language, view.state.doc.toString());
+  if (mode !== 'off') preview.render(kind, view.state.doc);
   if (mode !== 'full') view.requestMeasure();
-  post({ type: 'previewMode', mode });
+  post({ type: 'previewMode', mode, available: kind !== null, kind });
 }
 
 view.scrollDOM.addEventListener('scroll', () => {
@@ -508,7 +605,7 @@ window.ScratchEditor = {
   load(id, text, language) {
     flush();
     diff.close();
-    if (current.id && !isDiffDoc()) stateCache.set(current.id, view.state);
+    if (current.id && !isDiffDoc()) cacheState(current.id, view.state);
     workspace.stash();
     current = { id, language };
     expandStack = [];
@@ -518,7 +615,7 @@ window.ScratchEditor = {
       refresh();
     } else {
       const cached = stateCache.get(id);
-      if (cached && cached.doc.toString() === text) {
+      if (cached && cached.doc.length === text.length && cached.doc.toString() === text) {
         view.setState(cached);
         refresh();
       } else {
@@ -543,7 +640,7 @@ window.ScratchEditor = {
     const cached = stateCache.get(oldId);
     if (cached) {
       stateCache.delete(oldId);
-      stateCache.set(newId, cached);
+      cacheState(newId, cached);
     }
     if (responseRuns.has(oldId)) {
       responseRuns.set(newId, responseRuns.get(oldId));
@@ -585,7 +682,7 @@ window.ScratchEditor = {
   setKeymap(editor, app) {
     editorBindings = editor ?? {};
     appBindings = app ?? {};
-    setRunShortcut(keyLabel(appBindings.run));
+    setRunShortcut(keyLabel(keysOf(appBindings.run)[0]));
     view.dispatch({ effects: keymapConf.reconfigure(userKeymapExtension()) });
     for (const v of workspace.views()) v.dispatch({ effects: keymapConf.reconfigure(userKeymapExtension()) });
   },
@@ -703,8 +800,69 @@ window.ScratchEditor = {
     if (id === current.id && document.body.dataset.response === 'open') responsePanel.restore(run);
   },
   flush,
+  /** A standalone HTML page of the Markdown preview for the native exports; `mode` is 'print' or 'html'. */
+  previewDocument(title, mode) {
+    if (current.language !== 'markdown') return null;
+    return preview.printableDocument(view.state.doc.toString(), title, mode);
+  },
+  setSpecViewer(viewer) {
+    preview.setSpecViewer(viewer);
+  },
+  /** Zooms the Markdown preview when it is what the user is looking at; false leaves ⌘+/⌘− to the editor font. */
+  zoomPreview(step) {
+    const mode = document.body.dataset.preview;
+    if (current.language !== 'markdown' || isDiffDoc() || !mode || mode === 'off') return false;
+    if (mode === 'split' && (!preview.active || activeView().hasFocus)) return false;
+    preview.zoomBy(step);
+    return true;
+  },
+  copyRichText() {
+    if (current.language !== 'markdown') return false;
+    preview.copyRich(view.state.doc.toString());
+    return true;
+  },
   focus() {
     activeView().focus();
+  },
+  // ---- Go to Symbol; offsets are UTF-16 like everything else here ----
+  /** The outline of the document (or the focused side of a diff), remembering the scroll position to go back to. */
+  symbols() {
+    const target = activeView();
+    const language = isDiffDoc() ? workspace.syntax.value : current.language;
+    const { symbols, truncated } = documentSymbols(target.state, language);
+    symbolPeek = { view: target, top: target.scrollDOM.scrollTop, left: target.scrollDOM.scrollLeft };
+    const { doc } = target.state;
+    return {
+      truncated,
+      cursor: target.state.selection.main.head,
+      symbols: symbols.map((s) => [s.name, s.kind, s.from, s.to, s.end, s.depth, doc.lineAt(s.from).number, s.container, s.detail]),
+    };
+  },
+  peekSymbol(from) {
+    const target = symbolPeek?.view ?? activeView();
+    const pos = Math.min(from, target.state.doc.length);
+    target.dispatch({ effects: [setSymbolPeek.of(pos), EditorView.scrollIntoView(pos, { y: 'center' })] });
+  },
+  /** Jumps to (and selects) the chosen symbol, or with no range puts the view back where it was. */
+  endSymbolPeek(from, to) {
+    const target = symbolPeek?.view ?? activeView();
+    const saved = symbolPeek;
+    symbolPeek = null;
+    target.dispatch({ effects: setSymbolPeek.of(null) });
+    if (from == null) {
+      if (saved) {
+        target.scrollDOM.scrollTop = saved.top;
+        target.scrollDOM.scrollLeft = saved.left;
+      }
+    } else {
+      const len = target.state.doc.length;
+      target.dispatch({
+        selection: EditorSelection.single(Math.min(from, len), Math.min(to, len)),
+        effects: EditorView.scrollIntoView(Math.min(from, len), { y: 'center' }),
+        userEvent: 'select.symbol',
+      });
+    }
+    target.focus();
   },
 };
 

@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "scripts": {
-    "build": "esbuild src/editor.js --bundle --minify --format=iife --target=safari16 --outfile=dist/editor.bundle.js && cp src/index.html dist/index.html"
+    "build": "esbuild src/editor.js --bundle --minify --format=iife --target=safari16 --outfile=dist/editor.bundle.js && cp src/index.html src/viewer.html src/viewer.js src/viewer.css dist/ && cp node_modules/mermaid/dist/mermaid.min.js node_modules/swagger-ui-dist/swagger-ui-bundle.js node_modules/swagger-ui-dist/swagger-ui.css dist/ && cp node_modules/@scalar/api-reference/dist/browser/standalone.js dist/scalar.js && cp node_modules/@kong/spec-renderer/dist/kong-spec-renderer.web-component.umd.js dist/kong-spec-renderer.js && cp node_modules/@kong/spec-renderer/dist/spec-renderer.css dist/kong-spec-renderer.css"
   },
   "dependencies": {
     "@codemirror/autocomplete": "^6.18.0",
@@ -29,11 +29,15 @@
     "@codemirror/state": "^6.4.1",
     "@codemirror/theme-one-dark": "^6.1.2",
     "@codemirror/view": "^6.34.1",
+    "@kong/spec-renderer": "^1.117.1",
+    "@scalar/api-reference": "^1.75.1",
     "dompurify": "^3.4.16",
     "marked": "^18.0.14",
+    "mermaid": "^11.17.2",
     "prettier": "^3.9.9",
     "prettier-plugin-java": "2.8.1",
     "sql-formatter": "^15.9.0",
+    "swagger-ui-dist": "^5.34.0",
     "xml-formatter": "^3.6.3"
   },
   "devDependencies": {

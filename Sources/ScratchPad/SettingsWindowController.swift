@@ -282,7 +282,7 @@ private final class KeymapSettingsViewController: NSViewController, NSTableViewD
         search.placeholderString = "Search actions or shortcuts"
         search.delegate = self
 
-        for (id, title, width) in [("action", "Action", 280.0), ("category", "Category", 90.0), ("shortcut", "Shortcut", 140.0)] {
+        for (id, title, width) in [("action", "Action", 280.0), ("category", "Category", 90.0), ("shortcut", "Shortcut", 180.0)] {
             let col = NSTableColumn(identifier: .init(id))
             col.title = title
             col.width = width
@@ -301,14 +301,16 @@ private final class KeymapSettingsViewController: NSViewController, NSTableViewD
         scroll.borderType = .bezelBorder
 
         let change = NSButton(title: "Change…", target: self, action: #selector(changeShortcut))
+        let add = NSButton(title: "Add Shortcut…", target: self, action: #selector(addShortcut))
         let remove = NSButton(title: "Remove", target: self, action: #selector(removeShortcut))
         let reset = NSButton(title: "Reset", target: self, action: #selector(resetShortcut))
         let resetAll = NSButton(title: "Reset All", target: self, action: #selector(resetAll))
         let openFile = NSButton(title: "Open keymap.json", target: self, action: #selector(openKeymapFile))
-        let buttons = NSStackView(views: [change, remove, reset, NSView(), openFile, resetAll])
+        let buttons = NSStackView(views: [change, add, remove, reset, NSView(), openFile, resetAll])
 
         let hint = NSTextField(wrappingLabelWithString:
-            "Double-click an action to record a new shortcut. Customised shortcuts are shown in bold and stored in keymap.json.")
+            "Double-click an action to record a new shortcut, or use Add Shortcut… to give it another one. "
+                + "The first shortcut is shown in menus. Customised shortcuts are shown in bold and stored in keymap.json.")
         hint.font = .systemFont(ofSize: 11)
         hint.textColor = .secondaryLabelColor
 
@@ -330,8 +332,9 @@ private final class KeymapSettingsViewController: NSViewController, NSTableViewD
         let q = search.stringValue.lowercased()
         rows = q.isEmpty ? Actions.all : Actions.all.filter {
             $0.title.lowercased().contains(q) || $0.category.lowercased().contains(q)
-                || (KeymapStore.shared.key(for: $0.id)?.display.lowercased().contains(q) ?? false)
-                || (KeymapStore.shared.key(for: $0.id)?.string.lowercased().contains(q) ?? false)
+                || KeymapStore.shared.keys(for: $0.id).contains {
+                    $0.display.lowercased().contains(q) || $0.string.lowercased().contains(q)
+                }
         }
         table.reloadData()
     }
@@ -346,7 +349,9 @@ private final class KeymapSettingsViewController: NSViewController, NSTableViewD
         switch column?.identifier.rawValue {
         case "action": text = action.title
         case "category": text = action.category
-        default: text = KeymapStore.shared.key(for: action.id)?.display ?? "—"
+        default:
+            let keys = KeymapStore.shared.keys(for: action.id)
+            text = keys.isEmpty ? "—" : keys.map(\.display).joined(separator: ",  ")
         }
         let field = NSTextField(labelWithString: text)
         field.lineBreakMode = .byTruncatingTail
@@ -365,7 +370,13 @@ private final class KeymapSettingsViewController: NSViewController, NSTableViewD
 
     @objc private func changeShortcut() {
         guard let action = selected, let window = view.window else { return }
-        let sheet = ShortcutRecorderSheet(action: action)
+        let sheet = ShortcutRecorderSheet(action: action, adding: false)
+        window.beginSheet(sheet.window!) { _ in _ = sheet }
+    }
+
+    @objc private func addShortcut() {
+        guard let action = selected, let window = view.window else { return }
+        let sheet = ShortcutRecorderSheet(action: action, adding: true)
         window.beginSheet(sheet.window!) { _ in _ = sheet }
     }
 
@@ -403,17 +414,21 @@ private final class KeymapSettingsViewController: NSViewController, NSTableViewD
 
 private final class ShortcutRecorderSheet: NSWindowController {
     private let action: ActionDef
+    /// Adds a shortcut instead of replacing the existing ones.
+    private let adding: Bool
     private let recorder = RecorderView()
     private let conflictLabel = NSTextField(wrappingLabelWithString: "")
     private var combo: KeyCombo?
 
-    init(action: ActionDef) {
+    init(action: ActionDef, adding: Bool) {
         self.action = action
+        self.adding = adding
         let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 400, height: 180), styleMask: [.titled], backing: .buffered, defer: false)
         super.init(window: panel)
-        combo = KeymapStore.shared.key(for: action.id)
+        combo = adding ? nil : KeymapStore.shared.key(for: action.id)
 
-        let title = NSTextField(labelWithString: "Press the new shortcut for “\(action.title)”")
+        let title = NSTextField(labelWithString: adding ? "Press another shortcut for “\(action.title)”"
+                                    : "Press the new shortcut for “\(action.title)”")
         title.font = .boldSystemFont(ofSize: 13)
         recorder.onRecord = { [weak self] in self?.recorded($0) }
         recorder.combo = combo
@@ -464,10 +479,14 @@ private final class ShortcutRecorderSheet: NSWindowController {
         if saving {
             if let combo {
                 for other in KeymapStore.shared.conflicts(for: combo, excluding: action.id) {
-                    KeymapStore.shared.set(nil, for: other.id)
+                    KeymapStore.shared.remove(combo, from: other.id)
                 }
             }
-            KeymapStore.shared.set(combo, for: action.id)
+            if adding {
+                if let combo { KeymapStore.shared.add(combo, for: action.id) }
+            } else {
+                KeymapStore.shared.set(combo, for: action.id)
+            }
         }
         guard let window else { return }
         window.sheetParent?.endSheet(window)
